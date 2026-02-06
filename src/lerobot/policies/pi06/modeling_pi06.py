@@ -323,12 +323,11 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
 
-        # [수정] 기본 설정을 불러옵니다.
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152
         vlm_config_hf.image_token_index = 257152
         
-        # 1. LLM 설정 (Gemma 3 4B) - 외부에서 받아온 설정 적용
+        # 1. LLM 설정
         vlm_config_hf.text_config.hidden_size = vlm_config.width
         vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
         vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
@@ -341,19 +340,21 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
 
-        # 2. [핵심 수정] Vision 설정 (SigLIP So400M 스펙 강제 고정)
-        # 기본값(Base) 대신 So400M의 정확한 스펙을 입력합니다.
-        vlm_config_hf.vision_config.hidden_size = 1152      # So400M 핵심 (Base는 768)
-        vlm_config_hf.vision_config.num_hidden_layers = 27  # So400M 핵심 (Base는 12)
+        # 2. Vision 설정 (SigLIP So400M)
+        vlm_config_hf.vision_config.hidden_size = 1152      # So400M (4억) 스펙
+        vlm_config_hf.vision_config.num_hidden_layers = 27  # So400M 스펙
         vlm_config_hf.vision_config.num_attention_heads = 16
-        vlm_config_hf.vision_config.patch_size = 14
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.image_size = image_size
-        vlm_config_hf.vision_config.projection_dim = 2048
+        
+        # [수정 핵심] Vision Projector가 LLM 크기(3072)에 맞게 늘어나도록 변경!
+        # 기존: vlm_config_hf.vision_config.projection_dim = 2048 (에러 원인)
+        vlm_config_hf.vision_config.projection_dim = vlm_config.width 
+        
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 
-        # 3. Action Expert 설정
+        # 3. Expert 설정
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
             hidden_size=action_expert_config.width,
@@ -375,7 +376,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
 
-    # ... (아래 메서드들은 그대로 유지)
+    # ... (아래 메서드들은 파일 그대로 두시면 됩니다)
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
@@ -514,7 +515,6 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_past_key_values = None
 
         return [prefix_output, suffix_output], prefix_past_key_values
-
 
 class PI06Pytorch(nn.Module):
     """Core PI06 PyTorch model."""
