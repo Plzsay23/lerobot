@@ -84,8 +84,6 @@ class Pi06PrepareStateTokenizerProcessorStep(ProcessorStep):
             full_prompts.append(full_prompt)
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
-        # Normalize state to [-1, 1] range if needed (assuming it's already normalized by normalizer processor step!!)
-        # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         return transition
 
     def transform_features(
@@ -105,44 +103,38 @@ def make_pi06_pre_post_processors(
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for the PI0 policy.
-
-    The pre-processing pipeline prepares input data for the model by:
-    1. Renaming features to match pretrained configurations.
-    2. Normalizing input and output features based on dataset statistics.
-    3. Adding a batch dimension.
-    4. Appending a newline character to the task description for tokenizer compatibility.
-    5. Tokenizing the text prompt using the PaliGemma tokenizer.
-    6. Moving all data to the specified device.
-
-    The post-processing pipeline handles the model's output by:
-    1. Moving data to the CPU.
-    2. Unnormalizing the output features to their original scale.
-
-    Args:
-        config: The configuration object for the PI0 policy.
-        dataset_stats: A dictionary of statistics for normalization.
-        preprocessor_kwargs: Additional arguments for the pre-processor pipeline.
-        postprocessor_kwargs: Additional arguments for the post-processor pipeline.
-
-    Returns:
-        A tuple containing the configured pre-processor and post-processor pipelines.
+    Constructs pre-processor and post-processor pipelines for the PI06 policy.
     """
+
+    # [수정] 토크나이저 이름 자동 매핑 로직 추가
+    # 우리가 config에서 "gemma_3_4b"라고 설정했지만, 
+    # 실제 Hugging Face에는 그 이름의 토크나이저가 없으므로
+    # 호환되는 "google/gemma-2-9b-it" 토크나이저를 사용하도록 우회합니다.
+    if config.paligemma_variant == "gemma_3_4b":
+        tokenizer_name = "google/gemma-2-9b-it"  # 대체용 실존 토크나이저
+    elif config.paligemma_variant == "gemma_2b":
+        tokenizer_name = "google/gemma-2b-it"
+    elif config.paligemma_variant == "gemma_300m":
+        tokenizer_name = "google/gemma-2b-it"
+    else:
+        # 사용자가 직접 입력한 경로가 있다면 그걸 씀
+        tokenizer_name = config.paligemma_variant
 
     # Add remaining processors
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
         # NOTE: NormalizerProcessorStep MUST come before Pi06PrepareStateTokenizerProcessorStep
-        # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
         Pi06PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        
+        # [수정 적용] 위에서 결정한 tokenizer_name을 여기에 넣습니다.
         TokenizerProcessorStep(
-            tokenizer_name="google/paligemma-3-4b-it",
+            tokenizer_name=tokenizer_name,  # 수정된 변수 사용
             max_length=config.tokenizer_max_length,
             padding_side="right",
             padding="max_length",
