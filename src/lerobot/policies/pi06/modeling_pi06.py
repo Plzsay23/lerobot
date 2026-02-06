@@ -188,6 +188,9 @@ def compute_layer_complete(
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
+    print(f"DEBUG: query_states length: {len(query_states)}")
+    for i, t in enumerate(query_states):
+        print(f"DEBUG: tensor {i} shape: {t.shape}")
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
     value_states = torch.cat(value_states, dim=2)
