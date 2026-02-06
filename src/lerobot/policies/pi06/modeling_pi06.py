@@ -25,7 +25,6 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from typing_extensions import Unpack
-from transformers import AutoConfig
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -188,9 +187,6 @@ def compute_layer_complete(
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
-    print(f"DEBUG: query_states length: {len(query_states)}")
-    for i, t in enumerate(query_states):
-        print(f"DEBUG: tensor {i} shape: {t.shape}")
     query_states = torch.cat(query_states, dim=2)
     key_states = torch.cat(key_states, dim=2)
     value_states = torch.cat(value_states, dim=2)
@@ -251,7 +247,6 @@ class GemmaConfig:
 
 def get_gemma_config(variant: str) -> GemmaConfig:
     """Returns config for specified gemma variant."""
-    # 1. Standard Pi0.5 variants
     if variant == "gemma_300m":
         return GemmaConfig(
             width=1024,
@@ -270,20 +265,18 @@ def get_gemma_config(variant: str) -> GemmaConfig:
             num_kv_heads=1,
             head_dim=256,
         )
-    # 2. [논문 스펙 추가] Gemma 3 4B
     elif variant == "gemma_3_4b" or variant == "google/gemma-3-4b-it":
         return GemmaConfig(
-            width=3072,  # 4B 모델 추정 스펙
-            depth=32,
+            width=3072,  # 4B (3072 hidden size)
+            depth=34,    # Gemma 3 4B depth
             mlp_dim=12288,
             num_heads=24,
             num_kv_heads=8,
             head_dim=128,
         )
-    # 3. [논문 스펙 추가] Gemma 860M Expert
-    elif variant == "gemma_860m" or variant == "google/gemma-3-860m-it":
+    elif variant == "gemma_860m" or variant == "gemma_1b":
         return GemmaConfig(
-            width=1536,  # 860M Expert 추정 스펙
+            width=1536,  # 1B/860M equivalent
             depth=24,
             mlp_dim=6144,
             num_heads=12,
@@ -291,9 +284,10 @@ def get_gemma_config(variant: str) -> GemmaConfig:
             head_dim=128,
         )
     
-    # 그 외의 경우는 Hugging Face에서 가져오되, 에러나면 그대로 죽도록 둠 (사용자 의도 존중)
+    # Fallback to try loading from HF config if variant is a path
     try:
-        logging.info(f"Attempting to load config from Hugging Face: {variant}")
+        from transformers import AutoConfig
+        logging.info(f"Loading config from Hugging Face: {variant}")
         hf_config = AutoConfig.from_pretrained(variant)
         return GemmaConfig(
             width=hf_config.hidden_size,
@@ -303,8 +297,9 @@ def get_gemma_config(variant: str) -> GemmaConfig:
             num_kv_heads=hf_config.num_key_value_heads,
             head_dim=hf_config.head_dim,
         )
-    except Exception as e:
-        raise ValueError(f"Unknown variant or HF repo not found: {variant}. Error: {e}")
+    except Exception:
+        # If all else fails, raise error
+        raise ValueError(f"Unknown variant: {variant}")
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -330,7 +325,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf._vocab_size = 257152
         vlm_config_hf.image_token_index = 257152
         
-        # 1. LLM 설정
+        # 1. LLM Config
         vlm_config_hf.text_config.hidden_size = vlm_config.width
         vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
         vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
@@ -343,21 +338,20 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
 
-        # 2. Vision 설정 (SigLIP So400M)
-        vlm_config_hf.vision_config.hidden_size = 1152      # So400M (4억) 스펙
-        vlm_config_hf.vision_config.num_hidden_layers = 27  # So400M 스펙
+        # 2. Vision Config (SigLIP So400M)
+        vlm_config_hf.vision_config.hidden_size = 1152
+        vlm_config_hf.vision_config.num_hidden_layers = 27
         vlm_config_hf.vision_config.num_attention_heads = 16
         vlm_config_hf.vision_config.intermediate_size = 4304
         vlm_config_hf.vision_config.image_size = image_size
         
-        # [수정 핵심] Vision Projector가 LLM 크기(3072)에 맞게 늘어나도록 변경!
-        # 기존: vlm_config_hf.vision_config.projection_dim = 2048 (에러 원인)
-        vlm_config_hf.vision_config.projection_dim = vlm_config.width 
+        # [CRITICAL FIX]: Set projection_dim to match LLM width (3072 for 4B)
+        vlm_config_hf.vision_config.projection_dim = vlm_config.width
         
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 
-        # 3. Expert 설정
+        # 3. Expert Config
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
             hidden_size=action_expert_config.width,
@@ -379,7 +373,6 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
 
-    # ... (아래 메서드들은 파일 그대로 두시면 됩니다)
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
@@ -518,6 +511,7 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_past_key_values = None
 
         return [prefix_output, suffix_output], prefix_past_key_values
+
 
 class PI06Pytorch(nn.Module):
     """Core PI06 PyTorch model."""
