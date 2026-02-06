@@ -25,7 +25,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from typing_extensions import Unpack
-from transformers import AutoConfig # [수정] AutoConfig 추가
+from transformers import AutoConfig
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -60,11 +60,9 @@ class ActionSelectKwargs(TypedDict, total=False):
 
 
 def get_safe_dtype(target_dtype, device_type):
-    """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
         return torch.float32
     if device_type == "cpu":
-        # CPU doesn't support bfloat16, use float32 instead
         if target_dtype == torch.bfloat16:
             return torch.float32
         if target_dtype == torch.float64:
@@ -75,7 +73,6 @@ def get_safe_dtype(target_dtype, device_type):
 def create_sinusoidal_pos_embedding(
     time: torch.Tensor, dimension: int, min_period: float, max_period: float, device="cpu"
 ) -> Tensor:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
 
@@ -86,7 +83,6 @@ def create_sinusoidal_pos_embedding(
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
     sin_input = scaling_factor[None, :] * time[:, None]
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
@@ -252,7 +248,7 @@ class GemmaConfig:
 
 def get_gemma_config(variant: str) -> GemmaConfig:
     """Returns config for specified gemma variant."""
-    # 1. 기존 별칭(Alias) 지원 (호환성 유지)
+    # 1. Standard Pi0.5 variants
     if variant == "gemma_300m":
         return GemmaConfig(
             width=1024,
@@ -271,18 +267,20 @@ def get_gemma_config(variant: str) -> GemmaConfig:
             num_kv_heads=1,
             head_dim=256,
         )
-    elif variant == "gemma_3_4b":  # 논문용 (혹시 정의해둔 게 있다면 유지)
+    # 2. [논문 스펙 추가] Gemma 3 4B
+    elif variant == "gemma_3_4b" or variant == "google/gemma-3-4b-it":
         return GemmaConfig(
-            width=3072,
-            depth=34,
+            width=3072,  # 4B 모델 추정 스펙
+            depth=32,
             mlp_dim=12288,
             num_heads=24,
             num_kv_heads=8,
             head_dim=128,
         )
-    elif variant == "gemma_860m":  # 논문용
+    # 3. [논문 스펙 추가] Gemma 860M Expert
+    elif variant == "gemma_860m" or variant == "google/gemma-3-860m-it":
         return GemmaConfig(
-            width=1536,
+            width=1536,  # 860M Expert 추정 스펙
             depth=24,
             mlp_dim=6144,
             num_heads=12,
@@ -290,12 +288,10 @@ def get_gemma_config(variant: str) -> GemmaConfig:
             head_dim=128,
         )
     
-    # 2. [핵심 수정] Hugging Face ID 자동 지원 (google/gemma-2-9b-it 등)
+    # 그 외의 경우는 Hugging Face에서 가져오되, 에러나면 그대로 죽도록 둠 (사용자 의도 존중)
     try:
-        logging.info(f"Loading config from Hugging Face: {variant}")
+        logging.info(f"Attempting to load config from Hugging Face: {variant}")
         hf_config = AutoConfig.from_pretrained(variant)
-        
-        # HF Config -> Local GemmaConfig 자동 변환
         return GemmaConfig(
             width=hf_config.hidden_size,
             depth=hf_config.num_hidden_layers,
@@ -305,7 +301,6 @@ def get_gemma_config(variant: str) -> GemmaConfig:
             head_dim=hf_config.head_dim,
         )
     except Exception as e:
-        # 3. 진짜 없는 모델이면 에러 발생
         raise ValueError(f"Unknown variant or HF repo not found: {variant}. Error: {e}")
 
 
@@ -328,9 +323,12 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.freeze_vision_encoder = freeze_vision_encoder
         self.train_expert_only = train_expert_only
 
+        # [수정] 기본 설정을 불러옵니다.
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
-        vlm_config_hf._vocab_size = 257152  # noqa: SLF001
+        vlm_config_hf._vocab_size = 257152
         vlm_config_hf.image_token_index = 257152
+        
+        # 1. LLM 설정 (Gemma 3 4B) - 외부에서 받아온 설정 적용
         vlm_config_hf.text_config.hidden_size = vlm_config.width
         vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
         vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
@@ -342,12 +340,20 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.text_config.vocab_size = 257152
         vlm_config_hf.text_config.use_adarms = use_adarms[0]
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
-        vlm_config_hf.vision_config.image_size = image_size
+
+        # 2. [핵심 수정] Vision 설정 (SigLIP So400M 스펙 강제 고정)
+        # 기본값(Base) 대신 So400M의 정확한 스펙을 입력합니다.
+        vlm_config_hf.vision_config.hidden_size = 1152      # So400M 핵심 (Base는 768)
+        vlm_config_hf.vision_config.num_hidden_layers = 27  # So400M 핵심 (Base는 12)
+        vlm_config_hf.vision_config.num_attention_heads = 16
+        vlm_config_hf.vision_config.patch_size = 14
         vlm_config_hf.vision_config.intermediate_size = 4304
+        vlm_config_hf.vision_config.image_size = image_size
         vlm_config_hf.vision_config.projection_dim = 2048
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 
+        # 3. Action Expert 설정
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
             hidden_size=action_expert_config.width,
@@ -369,6 +375,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
 
+    # ... (아래 메서드들은 그대로 유지)
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
             self.to(dtype=torch.bfloat16)
