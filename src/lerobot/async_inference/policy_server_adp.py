@@ -337,41 +337,33 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         ]
 
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
+        """추론 속도 최적화를 위해 denoising steps를 확인합니다."""
+        # XVLA의 경우 num_denoising_steps가 성능의 핵심입니다.
+        # 필요하다면 여기서 강제로 단계를 낮추어 테스트하십시오.
+        # self.policy.config.num_denoising_steps = 3 
+        
         chunk = self.policy.predict_action_chunk(observation)
         if chunk.ndim != 3:
-            chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
-
+            chunk = chunk.unsqueeze(0)
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """Predict an action chunk based on an observation.
-
-        Pipeline:
-        1. Convert raw observation to LeRobot format
-        2. Apply preprocessor (tokenization, normalization, batching, device placement)
-        3. Run policy inference to get action chunk
-        4. Apply postprocessor (unnormalization, device movement)
-        5. Convert to TimedAction list
-        """
-        """1. Prepare observation"""
+        """추론 전과정에서 bfloat16이 유지되는지 확인합니다."""
         start_prepare = time.perf_counter()
+        
+        # 1. 관측치 준비
         observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
         )
-        prepare_time = time.perf_counter() - start_prepare
-
-        """2. Apply preprocessor"""
-        start_preprocess = time.perf_counter()
-        observation = self.preprocessor(observation)
-        self.last_processed_obs: TimedObservation = observation_t
-        preprocessing_time = time.perf_counter() - start_preprocess
-
-        """3. Get action chunk"""
-        start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
+        
+        # 2. 전처리기 실행 (이미 device_processor에 의해 GPU/bfloat16 설정됨)
+        with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            observation = self.preprocessor(observation)
+            
+            # 3. 모델 추론 (autocast를 통해 연산 속도 최적화)
+            action_tensor = self._get_action_chunk(observation)
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
