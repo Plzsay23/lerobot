@@ -130,10 +130,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         policy_specs = pickle.loads(request.data)  # nosec
 
         # 1. 어댑터 핫스왑 체크 (pretrained_name_or_path가 숫자인 경우)
-        instr = str(policy_specs.pretrained_name_or_path)
-        if instr.isdigit() and self.policy is not None:
-            self.adapter_manager.switch(int(instr))
-            return services_pb2.Empty()
+        if instr.isdigit():
+            if self.policy is not None:
+                self.adapter_manager.switch(int(instr))
+                return services_pb2.Empty()
+            else:
+                self.logger.error("❌ 에러: 베이스 모델이 로드되지 않았습니다. 먼저 태스크를 실행해 모델을 초기화하세요.")
+                return services_pb2.Empty()
 
         # 2. 최초 모델 로드 또는 전체 교체 로직 (기존 로직 보존)
         if policy_specs.policy_type not in SUPPORTED_POLICIES:
