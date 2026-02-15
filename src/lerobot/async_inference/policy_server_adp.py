@@ -148,7 +148,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
         policy_class = get_policy_class(self.policy_type)
-        
+    
         start = time.perf_counter()
         # 모델 인스턴스 생성
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
@@ -165,14 +165,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             },
             postprocessor_overrides={"device_processor": device_override},
         )
-        
+    
         # 매니저에 현재 로드된 정책 객체 등록
         self.adapter_manager.set_policy(self.policy)
 
         end = time.perf_counter()
         self.logger.info(f"모델 로드 완료: {end - start:.4f}초 소요")
 
-    return services_pb2.Empty()
+        return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
         """Receive observations from the robot client"""
