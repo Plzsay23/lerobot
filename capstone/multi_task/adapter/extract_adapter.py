@@ -1,7 +1,7 @@
 import os
 import torch
 from peft import PeftModel
-from lerobot.policies.factory import make_policy
+from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 from huggingface_hub import HfApi
 
 def main():
@@ -17,31 +17,41 @@ def main():
     target_repo = f"{hf_user}/{model_name}_adapter"
     tmp_save_dir = "temp_adapter_extract"
 
-    print(f"[{source_repo}]에서 모델 로드 중...")
+    print(f"[{source_repo}]에서 XVLA 모델 로드 중...")
     
-    # 1. LeRobot Factory를 통해 모델 로드
-    # 이 과정에서 모델은 로컬 캐시에 다운로드됩니다.
-    policy = make_policy(repo_id=source_repo)
+    try:
+        # lerobot의 방식대로 from_pretrained를 사용하여 로드 
+        policy = XVLAPolicy.from_pretrained(source_repo)
+    except Exception as e:
+        print(f"모델 로드 실패: {e}")
+        return
     
-    # 2. 어댑터 객체 식별
-    # SmolVLA나 xVLA 등 모델 구조에 따라 어댑터가 위치한 속성을 찾습니다.
+    # XVLA 모델 구조에서 PeftModel(어댑터) 위치 찾기 
+    # XVLA는 내부적으로 model.vlm 등을 포함함 
     model_to_extract = None
-    if hasattr(policy, "model") and isinstance(policy.model, PeftModel):
-        model_to_extract = policy.model
-    elif hasattr(policy, "vlm_with_expert") and hasattr(policy.vlm_with_expert, "vlm"):
-        if isinstance(policy.vlm_with_expert.vlm, PeftModel):
-            model_to_extract = policy.vlm_with_expert.vlm
+    
+    # XVLA 구조 탐색: policy.model.vlm이 보통 PeftModel임 
+    if hasattr(policy, "model") and hasattr(policy.model, "vlm"):
+        if isinstance(policy.model.vlm, PeftModel):
+            model_to_extract = policy.model.vlm
+    
+    # 찾지 못했을 경우 전체 구조에서 PeftModel 검색
+    if model_to_extract is None:
+        for module in policy.modules():
+            if isinstance(module, PeftModel):
+                model_to_extract = module
+                break
 
     if model_to_extract is None:
-        print("에러: 해당 모델에서 PeftModel(어댑터) 구조를 찾을 수 없습니다.")
+        print("에러: 이 모델에서 추출할 수 있는 Peft 어댑터를 찾지 못했습니다.")
+        print("주의: 학습 시 --peft.method=LORA 옵션을 사용했는지 확인하세요.")
         return
 
-    # 3. 어댑터만 로컬 임시 디렉토리에 저장
-    # 이 메소드는 베이스 모델 가중치를 제외하고 오직 어댑터 파일들만 생성합니다.
+    # 어댑터 파일만 추출
     print(f"어댑터 추출 중: {tmp_save_dir}")
     model_to_extract.save_pretrained(tmp_save_dir)
 
-    # 4. 허깅페이스에 새로운 레포로 업로드
+    # 허깅페이스 업로드
     print(f"[{target_repo}]로 업로드 중...")
     api = HfApi()
     api.create_repo(repo_id=target_repo, exist_ok=True)
