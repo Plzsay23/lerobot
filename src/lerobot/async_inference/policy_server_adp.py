@@ -122,7 +122,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
-    """로봇 클라이언트로부터 정책 설정 또는 어댑터 교체 명령을 받습니다."""
         if not self.running:
             self.logger.warning("Server is not running. Ignoring policy instructions.")
             return services_pb2.Empty()
