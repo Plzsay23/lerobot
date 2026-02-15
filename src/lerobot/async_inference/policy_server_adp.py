@@ -123,6 +123,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             
             # 매니저에 상주된 정책 객체 전달
             self.adapter_manager.set_policy(self.policy)
+            self.policy.config.num_denoising_steps = 3 
+            self.logger.info("✅ Denoising steps set to 3 for real-time performance.")
             self.logger.info("✅ 베이스 모델 및 기본 프로세서 VRAM 상주 완료.")
         except Exception as e:
             self.logger.error(f"❌ 베이스 모델 상주 실패: {e}")
@@ -338,7 +340,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """추론 속도 최적화를 위해 denoising steps를 확인합니다."""
-        # XVLA의 경우 num_denoising_steps가 성능의 핵심입니다.
+        # XVLA의 경우 num_denoising_steps가 성능의 predi핵심입니다.
         # 필요하다면 여기서 강제로 단계를 낮추어 테스트하십시오.
         # self.policy.config.num_denoising_steps = 3 
         
@@ -348,46 +350,55 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """추론 전과정에서 bfloat16이 유지되는지 확인합니다."""
+        """Predict an action chunk based on an observation.
+
+        Pipeline:
+        1. Convert raw observation to LeRobot format
+        2. Apply preprocessor (tokenization, normalization, batching, device placement)
+        3. Run policy inference to get action chunk
+        4. Apply postprocessor (unnormalization, device movement)
+        5. Convert to TimedAction list
+        """
+        """1. Prepare observation"""
         start_prepare = time.perf_counter()
-        
-        # 1. 관측치 준비
         observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
         )
-        
-        # 2. 전처리기 실행 (이미 device_processor에 의해 GPU/bfloat16 설정됨)
-        with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        prepare_time = time.perf_counter() - start_prepare
+
+        """2. Apply preprocessor"""
+        start_preprocess = time.perf_counter()
+        # 추론 모드에서 전처리 수행
+        with torch.inference_mode():
             observation = self.preprocessor(observation)
-            
-            # 3. 모델 추론 (autocast를 통해 연산 속도 최적화)
+        self.last_processed_obs: TimedObservation = observation_t
+        preprocessing_time = time.perf_counter() - start_preprocess
+
+        """3. Get action chunk"""
+        # [수정] 변수명 오타 해결 및 추론 시간 측정
+        start_inference = time.perf_counter()
+        with torch.inference_mode():
             action_tensor = self._get_action_chunk(observation)
         inference_time = time.perf_counter() - start_inference
+        
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
 
         """4. Apply postprocessor"""
-        # Apply postprocessor (handles unnormalization and device movement)
-        # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
-        # So we process each action in the chunk individually
         start_postprocess = time.perf_counter()
         _, chunk_size, _ = action_tensor.shape
 
-        # Process each action in the chunk
         processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
+        with torch.inference_mode():
+            for i in range(chunk_size):
+                single_action = action_tensor[:, i, :]
+                processed_action = self.postprocessor(single_action)
+                processed_actions.append(processed_action)
 
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
         action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
-        self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
-
         action_tensor = action_tensor.detach().cpu()
 
         """5. Convert to TimedAction list"""
@@ -399,15 +410,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self.logger.info(
             f"Observation {observation_t.get_timestep()} | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
-        )
-
-        self.logger.debug(
-            f"Observation {observation_t.get_timestep()} | "
-            f"Prepare time: {1000 * prepare_time:.2f}ms | "
-            f"Preprocessing time: {1000 * preprocessing_time:.2f}ms | "
-            f"Inference time: {1000 * inference_time:.2f}ms | "
-            f"Postprocessing time: {1000 * postprocessing_time:.2f}ms | "
             f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
         )
 
