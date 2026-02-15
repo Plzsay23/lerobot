@@ -64,6 +64,7 @@ from .helpers import (
 
 # 멀티 어댑터 추가
 from .multi_adapter_manager import MultiAdapterManager
+import os
 
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
