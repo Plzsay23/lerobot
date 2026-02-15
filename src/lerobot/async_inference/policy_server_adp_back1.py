@@ -75,57 +75,27 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.config = config
         self.shutdown_event = threading.Event()
 
-        # FPS 및 큐 설정
+        # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=config.fps)
+
         self.observation_queue = Queue(maxsize=1)
+
         self._predicted_timesteps_lock = threading.Lock()
         self._predicted_timesteps = set()
+
         self.last_processed_obs = None
 
-        # 모델 및 프로세서 속성
-        self.device = config.device if hasattr(config, "device") else "cuda"
-        self.policy_type = "xvla" # XVLA 정책 고정
+        # Attributes will be set by SendPolicyInstructions
+        self.device = None
+        self.policy_type = None
         self.lerobot_features = None
         self.actions_per_chunk = None
         self.policy = None
-        self.preprocessor = None
-        self.postprocessor = None
+        self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
+        self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
 
-        # [수정] 멀티 어댑터 매니저 초기화 (이때 어댑터들이 VRAM에 상주됨)
+        # 멀티 어댑터 추가
         self.adapter_manager = MultiAdapterManager(self.logger)
-
-        # [수정] 서버 시작 시 베이스 모델을 VRAM에 즉시 상주
-        self._initialize_base_model()
-
-    def _initialize_base_model(self):
-        """서버 시작 시 베이스 모델을 bfloat16 정밀도로 VRAM에 로드하여 상주시킵니다."""
-        base_model_path = os.getenv("BASE_MODEL", "lerobot/xvla-base")
-        self.logger.info(f"🚀 [INIT] 베이스 모델 VRAM 상주 시작 (bfloat16): {base_model_path}")
-        
-        try:
-            # 정책 클래스 확보 및 모델 로드
-            policy_class = get_policy_class(self.policy_type)
-            self.policy = policy_class.from_pretrained(
-                base_model_path, 
-                dtype="bfloat16" # 하프 프리시전 강제
-            )
-            self.policy.to(self.device)
-            self.policy.eval() # 추론 모드 설정
-            
-            # 기본 전/후처리기 생성 (장치 최적화)
-            device_override = {"device": self.device}
-            self.preprocessor, self.postprocessor = make_pre_post_processors(
-                self.policy.config,
-                pretrained_path=base_model_path,
-                preprocessor_overrides={"device_processor": device_override},
-                postprocessor_overrides={"device_processor": device_override},
-            )
-            
-            # 매니저에 상주된 정책 객체 전달
-            self.adapter_manager.set_policy(self.policy)
-            self.logger.info("✅ 베이스 모델 및 기본 프로세서 VRAM 상주 완료.")
-        except Exception as e:
-            self.logger.error(f"❌ 베이스 모델 상주 실패: {e}")
 
     @property
     def running(self):
@@ -152,17 +122,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return services_pb2.Empty()
 
-    def SendPolicyInstructions(self, request, context):
-        """클라이언트의 요청을 받아 어댑터를 핫스왑하거나 인스트럭션을 업데이트합니다."""
-        if not self.running:
+    def SendPolicyInstructions(self, request, context): #
+        """로봇 클라이언트로부터 정책 설정 또는 어댑터 교체 명령을 받습니다."""
+        if not self.running: #
+            self.logger.warning("Server is not running. Ignoring policy instructions.")
             return services_pb2.Empty()
 
-        policy_specs = pickle.loads(request.data)
+        client_id = context.peer() #
+        policy_specs = pickle.loads(request.data) #
+
+        # 1. 입력 문자열 해석 (VLM 모사)
         instr = str(policy_specs.pretrained_name_or_path).strip()
-        
-        # 1. 입력 문자열에서 어댑터 번호와 인스트럭션 텍스트 분리
         target_adapter_idx = None
         instruction_text = instr
+
         if " " in instr:
             parts = instr.split(" ", 1)
             if parts[0].isdigit():
@@ -172,18 +145,42 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             target_adapter_idx = int(instr)
             instruction_text = "default task"
 
-        # 2. 클라이언트 환경 정보 업데이트 (최초 접속 시 기준)
+        # 2. 필수 설정값 상주 (None 에러 방지)
+        self.device = policy_specs.device or self.device
+        self.policy_type = policy_specs.policy_type or self.policy_type
         self.lerobot_features = policy_specs.lerobot_features or self.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk or self.actions_per_chunk
 
-        # 3. [VRAM 핫스왑] 이미 로드된 모델의 가중치를 즉시 교체
+        # 3. [핵심] 베이스 모델 상주 로직
+        if self.policy is None:
+            # 숫자가 들어왔더라도 모델이 없으면 베이스 모델부터 로드해야 함
+            base_model_path = os.getenv("BASE_MODEL", "lerobot/xvla-base")
+            self.logger.info(f"🚀 베이스 모델 램 상주 시작: {base_model_path}")
+            
+            policy_class = get_policy_class(self.policy_type)
+            self.policy = policy_class.from_pretrained(base_model_path)
+            self.policy.to(self.device)
+
+            # 전/후처리기 초기화
+            device_override = {"device": self.device}
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                self.policy.config,
+                pretrained_path=base_model_path,
+                preprocessor_overrides={
+                    "device_processor": device_override,
+                    "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                },
+                postprocessor_overrides={"device_processor": device_override},
+            )
+            # 매니저에 상주된 정책 객체 전달
+            self.adapter_manager.set_policy(self.policy)
+
+        # 4. 어댑터 핫스왑 (모델이 있는 상태에서 실행됨)
         if target_adapter_idx is not None:
-            # 이 작업은 VRAM 내 복사로 이루어져 매우 빠릅니다.
             self.adapter_manager.switch(target_adapter_idx)
 
-        # 4. 모델의 현재 작업 명령어 업데이트
         self.current_instruction = instruction_text
-        self.logger.info(f"📡 명령 수신: 어댑터 ID={target_adapter_idx}, 태스크='{instruction_text}'")
+        self.logger.info(f"✅ 준비 완료: 어댑터={target_adapter_idx}, 태스크='{instruction_text}'")
         
         return services_pb2.Empty()
 
