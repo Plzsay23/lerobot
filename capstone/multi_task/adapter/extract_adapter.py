@@ -1,67 +1,67 @@
 import os
 import torch
-from peft import PeftModel
+import shutil
 from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, whoami
+
+def get_current_username():
+    try:
+        return whoami()['name']
+    except Exception:
+        print("❌ 오류: 허깅페이스 로그인이 필요합니다.")
+        exit(1)
 
 def main():
-    # 환경 변수 읽기
-    hf_user = os.getenv("HF_USER")
-    model_name = os.getenv("MODEL_NAME")
+    # 환경 변수 및 유저 정보 설정
+    username = get_current_username()
+    model_name = os.getenv("MODEL_NAME") # 예: pap_black_xvla
     
-    if not hf_user or not model_name:
-        print("에러: HF_USER 또는 MODEL_NAME 환경 변수가 설정되지 않았습니다.")
+    src_repo = f"{username}/{model_name}"
+    dest_repo = f"{username}/{model_name}_adapter"
+    tmp_dir = "./tmp_xvla_adapter"
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    print(f"==> 1. {src_repo}에서 XVLA 모델 로드 중...")
+    # XVLAPolicy.from_pretrained로 전체 가중치 로드 
+    policy = XVLAPolicy.from_pretrained(src_repo)
+    
+    print("==> 2. XVLA 어댑터 가중치 추출 중 (키워드 매칭)...")
+    adapter_state_dict = {}
+    
+    # XVLA에서 학습 가능한 핵심 레이어 키워드 
+    # - transformer: 정책 결정 헤드
+    # - soft_prompt_hub: 소프트 프롬프트
+    # - action_space: 액션 관련 레이어
+    target_keywords = ["transformer", "soft_prompt_hub", "action_space"]
+    
+    found_keys = 0
+    for name, param in policy.model.named_parameters():
+        if any(key in name for key in target_keywords):
+            # 'model.' 접두사가 붙어있을 수 있으므로 가중치 이름 유지
+            adapter_state_dict[name] = param.cpu()
+            found_keys += 1
+    
+    if found_keys == 0:
+        print("❌ 오류: 추출할 가중치를 찾지 못했습니다. 키워드를 확인하세요.")
         return
 
-    source_repo = f"{hf_user}/{model_name}"
-    target_repo = f"{hf_user}/{model_name}_adapter"
-    tmp_save_dir = "temp_adapter_extract"
+    print(f"   (총 {found_keys}개의 레이어 추출 완료)")
 
-    print(f"[{source_repo}]에서 XVLA 모델 로드 중...")
+    # 가중치 및 설정 저장
+    torch.save(adapter_state_dict, os.path.join(tmp_dir, "adapter_model.bin"))
+    policy.config.save_pretrained(tmp_dir)
     
-    try:
-        # lerobot의 방식대로 from_pretrained를 사용하여 로드 
-        policy = XVLAPolicy.from_pretrained(source_repo)
-    except Exception as e:
-        print(f"모델 로드 실패: {e}")
-        return
-    
-    # XVLA 모델 구조에서 PeftModel(어댑터) 위치 찾기 
-    # XVLA는 내부적으로 model.vlm 등을 포함함 
-    model_to_extract = None
-    
-    # XVLA 구조 탐색: policy.model.vlm이 보통 PeftModel임 
-    if hasattr(policy, "model") and hasattr(policy.model, "vlm"):
-        if isinstance(policy.model.vlm, PeftModel):
-            model_to_extract = policy.model.vlm
-    
-    # 찾지 못했을 경우 전체 구조에서 PeftModel 검색
-    if model_to_extract is None:
-        for module in policy.modules():
-            if isinstance(module, PeftModel):
-                model_to_extract = module
-                break
-
-    if model_to_extract is None:
-        print("에러: 이 모델에서 추출할 수 있는 Peft 어댑터를 찾지 못했습니다.")
-        print("주의: 학습 시 --peft.method=LORA 옵션을 사용했는지 확인하세요.")
-        return
-
-    # 어댑터 파일만 추출
-    print(f"어댑터 추출 중: {tmp_save_dir}")
-    model_to_extract.save_pretrained(tmp_save_dir)
-
-    # 허깅페이스 업로드
-    print(f"[{target_repo}]로 업로드 중...")
+    print(f"==> 3. {dest_repo}로 업로드 중...")
     api = HfApi()
-    api.create_repo(repo_id=target_repo, exist_ok=True)
+    api.create_repo(repo_id=dest_repo, exist_ok=True)
     api.upload_folder(
-        folder_path=tmp_save_dir,
-        repo_id=target_repo,
-        repo_type="model"
+        folder_path=tmp_dir,
+        repo_id=dest_repo,
+        repo_type="model",
     )
     
-    print(f"성공! 어댑터가 {target_repo}에 업로드되었습니다.")
+    shutil.rmtree(tmp_dir)
+    print(f"✅ 완료! 주소: https://huggingface.co/{dest_repo}")
 
 if __name__ == "__main__":
     main()
