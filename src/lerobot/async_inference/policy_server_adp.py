@@ -155,14 +155,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):
-        """클라이언트의 요청을 받아 어댑터를 핫스왑하거나 인스트럭션을 업데이트합니다."""
+        """클라이언트의 새 명령(어댑터 번호 + 텍스트)을 처리합니다."""
         if not self.running:
             return services_pb2.Empty()
 
         policy_specs = pickle.loads(request.data)
         instr = str(policy_specs.pretrained_name_or_path).strip()
         
-        # 1. 입력 문자열에서 어댑터 번호와 인스트럭션 텍스트 분리
+        # 1. 입력 문자열 해석 ('1 pick up' -> ID: 1, Text: 'pick up')
         target_adapter_idx = None
         instruction_text = instr
         if " " in instr:
@@ -174,18 +174,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             target_adapter_idx = int(instr)
             instruction_text = "default task"
 
-        # 2. 클라이언트 환경 정보 업데이트 (최초 접속 시 기준)
+        # 2. 메타데이터 업데이트 (필요 시)
         self.lerobot_features = policy_specs.lerobot_features or self.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk or self.actions_per_chunk
 
-        # 3. [VRAM 핫스왑] 이미 로드된 모델의 가중치를 즉시 교체
+        # 3. [병목 제거] 명령이 왔을 때만 어댑터를 갈아끼웁니다.
         if target_adapter_idx is not None:
-            # 이 작업은 VRAM 내 복사로 이루어져 매우 빠릅니다.
+            start_switch = time.perf_counter()
             self.adapter_manager.switch(target_adapter_idx)
+            switch_time = time.perf_counter() - start_switch
+            self.logger.info(f"🔄 어댑터 {target_adapter_idx}번으로 교체 완료 ({switch_time:.4f}s)")
 
-        # 4. 모델의 현재 작업 명령어 업데이트
+        # 4. 텍스트 명령어 저장
         self.current_instruction = instruction_text
-        self.logger.info(f"📡 명령 수신: 어댑터 ID={target_adapter_idx}, 태스크='{instruction_text}'")
+        self.logger.info(f"📡 새 태스크 설정: '{instruction_text}'")
         
         return services_pb2.Empty()
 
@@ -350,9 +352,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """관측치를 바탕으로 액션 청크를 예측합니다."""
+        """순수하게 추론 연산만 수행합니다. (어댑터 교체 로직 없음)"""
         
-        """1. Prepare observation"""
+        # 1. 관측치 데이터 준비
         start_prepare = time.perf_counter()
         observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
@@ -361,27 +363,28 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
         prepare_time = time.perf_counter() - start_prepare
 
-        """2. Apply preprocessor"""
-        start_preprocess = time.perf_counter()
-        # 불필요한 그래디언트 계산을 막아 속도를 높입니다.
-        with torch.inference_mode():
-            observation = self.preprocessor(observation)
-        self.last_processed_obs: TimedObservation = observation_t
-        preprocessing_time = time.perf_counter() - start_preprocess
-
-        """3. Get action chunk"""
-        # [수정] 변수명 오타 해결 및 시간 측정 시작
+        # 2. 전처리 및 추론 (병목 감시 로그 포함)
         start_inference = time.perf_counter()
-        with torch.inference_mode():
-            # 실제 모델 추론 수행
+        
+        # [디버깅] 현재 설정된 Denoising Steps 확인
+        current_steps = self.policy.config.num_denoising_steps
+        
+        with torch.inference_mode(): #
+            # 전처리
+            observation = self.preprocessor(observation)
+            
+            # 모델 추론 (어댑터는 이미 상주된 상태로 연산만 수행)
             action_tensor = self._get_action_chunk(observation)
+            
         inference_time = time.perf_counter() - start_inference
         
+        # [성능 모니터링] Steps와 시간을 함께 출력
         self.logger.info(
-            f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
+            f"🚀 [Steps: {current_steps}] Inference took {inference_time:.4f}s | "
+            f"Shape: {action_tensor.shape}"
         )
 
-        """4. Apply postprocessor"""
+        # 3. 후처리 및 TimedAction 변환
         start_postprocess = time.perf_counter()
         _, chunk_size, _ = action_tensor.shape
 
@@ -392,22 +395,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 processed_action = self.postprocessor(single_action)
                 processed_actions.append(processed_action)
 
-        # 결과 텐서 결합 및 CPU 이동
         action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
         action_tensor = action_tensor.detach().cpu()
 
-        """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
             observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
         )
-        postprocess_stops = time.perf_counter()
-        postprocessing_time = postprocess_stops - start_postprocess
-
-        self.logger.info(
-            f"Observation {observation_t.get_timestep()} | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
-        )
-
+        
         return action_chunk
 
     def stop(self):
