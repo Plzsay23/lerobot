@@ -514,36 +514,40 @@ def async_client(cfg: RobotClientConfig):
         try:
             print("\n[VLM 대기] 태스크를 입력하세요 (형식: '[번호] [내용]', 예: '1 pick up')")
             user_input = input(">>> ").strip()
-        
+            
             if user_input.lower() in ["exit", "quit"]:
                 break
+            
             if not user_input:
                 continue
 
-            # 모든 입력을 pretrained_name_or_path로 실어 보냄
-            # 서버의 SendPolicyInstructions가 이를 해석하여 어댑터를 바꿈
+            # 서버가 최초에 모델을 만들 때 필요한 필수 설정들을 그대로 유지
             cfg.pretrained_name_or_path = user_input
-            cfg.task = user_input # 인스트럭션으로도 저장
-        
+            
             print(f"📡 VLM에 명령 전송 중: '{user_input}'")
 
+            # 클라이언트 생성 시 기존 cfg(policy_type 등 포함)를 그대로 사용
             client = RobotClient(cfg, robot=shared_robot)
             client.set_instruction(user_input)
 
             if client.start():
-                # 서버에서 어댑터 교체가 완료된 후 즉시 실행 루프 진입
                 action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
                 action_receiver_thread.start()
 
                 try:
+                    # 제어 루프 진입
                     client.control_loop(task=user_input)
                 except KeyboardInterrupt:
-                    print("\n🛑 실행 중단. 다음 명령 대기...")
+                    print("\n🛑 동작 중단. 다음 명령 대기...")
                 finally:
-                    client.stop_session() # 통신 종료 로직 (로봇은 유지)
-                
+                    # 통신만 종료하고 모델은 서버 램에 유지
+                    client.shutdown_event.set()
+                    client.channel.close()
+                    if action_receiver_thread.is_alive():
+                        action_receiver_thread.join(timeout=1.0)
+                        
         except Exception as e:
-            print(f"❌ 에러: {e}")
+            print(f"오류 발생: {e}")
             
     # 프로그램 종료 시 로봇 연결 해제
     if 'shared_robot' in locals():

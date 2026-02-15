@@ -122,15 +122,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return services_pb2.Empty()
 
-    def SendPolicyInstructions(self, request, context):
-        if not self.running:
+    def SendPolicyInstructions(self, request, context): #
+        """로봇 클라이언트로부터 정책 설정 또는 어댑터 교체 명령을 받습니다."""
+        if not self.running: #
+            self.logger.warning("Server is not running. Ignoring policy instructions.")
             return services_pb2.Empty()
 
-        policy_specs = pickle.loads(request.data)
+        client_id = context.peer() #
+        policy_specs = pickle.loads(request.data) #
+
+        # 1. 입력 문자열 해석 (VLM 모사)
         instr = str(policy_specs.pretrained_name_or_path).strip()
-        
-        # [디버깅 모드] 문자열에서 어댑터 번호 추출 (VLM의 원핫 출력을 시뮬레이션)
-        # 예: "1 table_pick" 이 입력되면 '1'을 어댑터 인덱스로 간주
         target_adapter_idx = None
         instruction_text = instr
 
@@ -143,28 +145,42 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             target_adapter_idx = int(instr)
             instruction_text = "default task"
 
-        self.logger.info(f"==> VLM 해석 결과: 어댑터={target_adapter_idx}, 인스트럭션='{instruction_text}'")
+        # 2. 필수 설정값 상주 (None 에러 방지)
+        self.device = policy_specs.device or self.device
+        self.policy_type = policy_specs.policy_type or self.policy_type
+        self.lerobot_features = policy_specs.lerobot_features or self.lerobot_features
+        self.actions_per_chunk = policy_specs.actions_per_chunk or self.actions_per_chunk
 
-        # 1. 최초 실행 시 모델 로드 (XVLA 베이스 상주)
+        # 3. [핵심] 베이스 모델 상주 로직
         if self.policy is None:
-            # 베이스 모델명은 환경 변수나 고정값으로 설정
-            base_model = os.getenv("BASE_MODEL", "lerobot/xvla-base")
-            self.logger.info(f"최초 베이스 모델 로딩: {base_model}")
+            # 숫자가 들어왔더라도 모델이 없으면 베이스 모델부터 로드해야 함
+            base_model_path = os.getenv("BASE_MODEL", "lerobot/xvla-base")
+            self.logger.info(f"🚀 베이스 모델 램 상주 시작: {base_model_path}")
             
-            # 기존 로직을 빌려와 모델 초기화
             policy_class = get_policy_class(self.policy_type)
-            self.policy = policy_class.from_pretrained(base_model)
+            self.policy = policy_class.from_pretrained(base_model_path)
             self.policy.to(self.device)
-            
-            # 전처리기 등 설정
+
+            # 전/후처리기 초기화
+            device_override = {"device": self.device}
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                self.policy.config,
+                pretrained_path=base_model_path,
+                preprocessor_overrides={
+                    "device_processor": device_override,
+                    "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+                },
+                postprocessor_overrides={"device_processor": device_override},
+            )
+            # 매니저에 상주된 정책 객체 전달
             self.adapter_manager.set_policy(self.policy)
 
-        # 2. VLM이 결정한 어댑터로 즉시 스위칭 (Hot-swapping)
+        # 4. 어댑터 핫스왑 (모델이 있는 상태에서 실행됨)
         if target_adapter_idx is not None:
             self.adapter_manager.switch(target_adapter_idx)
 
-        # 3. 인스트럭션 텍스트는 내부 상태로 저장 (추후 추론 시 사용)
         self.current_instruction = instruction_text
+        self.logger.info(f"✅ 준비 완료: 어댑터={target_adapter_idx}, 태스크='{instruction_text}'")
         
         return services_pb2.Empty()
 
