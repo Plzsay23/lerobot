@@ -401,6 +401,29 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         action_chunk = self._time_action_chunk(
             observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
         )
+
+        """4. Apply postprocessor & Slicing"""
+        start_postprocess = time.perf_counter()
+        
+        # 모델의 20차원 출력에서 로봇의 실제 차원(예: 6)만 추출
+        actual_dim = len(self.lerobot_features.get("action", [])) or 6 
+        action_tensor = action_tensor[:, :, :actual_dim] # [1, 30, 20] -> [1, 30, 6]
+        
+        self.logger.debug(f"Sliced action shape for robot: {action_tensor.shape}")
+
+        processed_actions = []
+        with torch.inference_mode():
+            for i in range(action_tensor.shape[1]):
+                single_action = action_tensor[:, i, :]
+                # 후처리기가 6차원 데이터를 처리하도록 함
+                processed_action = self.postprocessor(single_action)
+                processed_actions.append(processed_action)
+
+        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
+        
+        # [중요] 액션 값이 모두 0이거나 너무 작지 않은지 확인 (디버깅용)
+        if torch.abs(action_tensor).max() < 1e-5:
+            self.logger.warning("⚠️ 경고: 생성된 액션 값이 거의 0입니다. 모델이 정지 상태를 출력 중입니다.")
         
         return action_chunk
 
