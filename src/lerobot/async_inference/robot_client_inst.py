@@ -512,42 +512,53 @@ def async_client(cfg: RobotClientConfig):
     # 2. 메인 루프 (입력 -> 실행 -> 중단 -> 반복)
     while True:
         try:
-            print("\n[VLM 대기] 태스크를 입력하세요 (형식: '[번호] [내용]', 예: '1 pick up')")
-            user_input = input(">>> ").strip()
+            print("\n명령을 입력하세요 (종료하려면 'exit' 입력)")
+            user_instruction = input(">>> ")
             
-            if user_input.lower() in ["exit", "quit"]:
+            if user_instruction.lower() in ["exit", "quit"]:
+                print("시스템을 종료합니다.")
                 break
             
-            if not user_input:
+            if not user_instruction.strip():
                 continue
 
-            # 서버가 최초에 모델을 만들 때 필요한 필수 설정들을 그대로 유지
-            cfg.pretrained_name_or_path = user_input
+            # 설정에 명령어 반영
+            cfg.task = user_instruction
             
-            print(f"📡 VLM에 명령 전송 중: '{user_input}'")
+            print(f"실행 중: '{user_instruction}'")
+            print("   (중단하고 다시 명령을 내리려면 'Ctrl + C'를 누르세요)")
 
-            # 클라이언트 생성 시 기존 cfg(policy_type 등 포함)를 그대로 사용
+            # 3. 클라이언트 생성 (미리 만든 shared_robot을 주입!)
             client = RobotClient(cfg, robot=shared_robot)
-            client.set_instruction(user_input)
+            
+            # 명령어 변수 확실하게 설정
+            client.set_instruction(user_instruction)
 
             if client.start():
+                client.logger.info("Starting action receiver thread...")
                 action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
                 action_receiver_thread.start()
 
                 try:
-                    # 제어 루프 진입
-                    client.control_loop(task=user_input)
+                    # 로봇 실행 (Ctrl+C를 누를 때까지 여기서 멈춤)
+                    client.control_loop(task=user_instruction)
+
                 except KeyboardInterrupt:
-                    print("\n🛑 동작 중단. 다음 명령 대기...")
+                    print("\n동작 정지! 대기 모드로 전환합니다.")
+                    # 안전 정지 코드가 있다면 여기서 호출 (예: shared_robot.teleop_safety_stop())
+                    
                 finally:
-                    # 통신만 종료하고 모델은 서버 램에 유지
+                    # 이번 세션 종료 (로봇 연결은 끊지 않음)
                     client.shutdown_event.set()
-                    client.channel.close()
+                    client.channel.close() # 서버와의 통신만 닫음
                     if action_receiver_thread.is_alive():
                         action_receiver_thread.join(timeout=1.0)
                         
         except Exception as e:
             print(f"오류 발생: {e}")
+            import traceback
+            traceback.print_exc()
+            break
             
     # 프로그램 종료 시 로봇 연결 해제
     if 'shared_robot' in locals():
