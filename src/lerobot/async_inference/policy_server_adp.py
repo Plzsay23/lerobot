@@ -350,15 +350,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """Predict an action chunk based on an observation.
-
-        Pipeline:
-        1. Convert raw observation to LeRobot format
-        2. Apply preprocessor (tokenization, normalization, batching, device placement)
-        3. Run policy inference to get action chunk
-        4. Apply postprocessor (unnormalization, device movement)
-        5. Convert to TimedAction list
-        """
+        """관측치를 바탕으로 액션 청크를 예측합니다."""
+        
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
         observation: Observation = raw_observation_to_observation(
@@ -370,16 +363,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """2. Apply preprocessor"""
         start_preprocess = time.perf_counter()
-        # 추론 모드에서 전처리 수행
+        # 불필요한 그래디언트 계산을 막아 속도를 높입니다.
         with torch.inference_mode():
             observation = self.preprocessor(observation)
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
         """3. Get action chunk"""
-        # [수정] 변수명 오타 해결 및 추론 시간 측정
+        # [수정] 변수명 오타 해결 및 시간 측정 시작
         start_inference = time.perf_counter()
         with torch.inference_mode():
+            # 실제 모델 추론 수행
             action_tensor = self._get_action_chunk(observation)
         inference_time = time.perf_counter() - start_inference
         
@@ -398,6 +392,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 processed_action = self.postprocessor(single_action)
                 processed_actions.append(processed_action)
 
+        # 결과 텐서 결합 및 CPU 이동
         action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
         action_tensor = action_tensor.detach().cpu()
 
