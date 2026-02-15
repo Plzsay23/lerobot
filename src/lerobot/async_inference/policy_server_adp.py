@@ -121,59 +121,50 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return services_pb2.Empty()
 
-    def SendPolicyInstructions(self, request, context):  # noqa: N802
+    def SendPolicyInstructions(self, request, context):
         if not self.running:
-            self.logger.warning("Server is not running. Ignoring policy instructions.")
             return services_pb2.Empty()
 
-        client_id = context.peer()
-        policy_specs = pickle.loads(request.data)  # nosec
+        policy_specs = pickle.loads(request.data)
+        instr = str(policy_specs.pretrained_name_or_path).strip()
+        
+        # [디버깅 모드] 문자열에서 어댑터 번호 추출 (VLM의 원핫 출력을 시뮬레이션)
+        # 예: "1 table_pick" 이 입력되면 '1'을 어댑터 인덱스로 간주
+        target_adapter_idx = None
+        instruction_text = instr
 
-        # 1. 어댑터 핫스왑 체크 (pretrained_name_or_path가 숫자인 경우)
-        if instr.isdigit():
-            if self.policy is not None:
-                self.adapter_manager.switch(int(instr))
-                return services_pb2.Empty()
-            else:
-                self.logger.error("❌ 에러: 베이스 모델이 로드되지 않았습니다. 먼저 태스크를 실행해 모델을 초기화하세요.")
-                return services_pb2.Empty()
+        if " " in instr:
+            parts = instr.split(" ", 1)
+            if parts[0].isdigit():
+                target_adapter_idx = int(parts[0])
+                instruction_text = parts[1]
+        elif instr.isdigit():
+            target_adapter_idx = int(instr)
+            instruction_text = "default task"
 
-        # 2. 최초 모델 로드 또는 전체 교체 로직 (기존 로직 보존)
-        if policy_specs.policy_type not in SUPPORTED_POLICIES:
-            raise ValueError(f"Policy type {policy_specs.policy_type} not supported.")
+        self.logger.info(f"==> VLM 해석 결과: 어댑터={target_adapter_idx}, 인스트럭션='{instruction_text}'")
 
-        self.logger.info(f"명령 수신: {policy_specs.pretrained_name_or_path} (로드 시작)")
+        # 1. 최초 실행 시 모델 로드 (XVLA 베이스 상주)
+        if self.policy is None:
+            # 베이스 모델명은 환경 변수나 고정값으로 설정
+            base_model = os.getenv("BASE_MODEL", "lerobot/xvla-base")
+            self.logger.info(f"최초 베이스 모델 로딩: {base_model}")
+            
+            # 기존 로직을 빌려와 모델 초기화
+            policy_class = get_policy_class(self.policy_type)
+            self.policy = policy_class.from_pretrained(base_model)
+            self.policy.to(self.device)
+            
+            # 전처리기 등 설정
+            self.adapter_manager.set_policy(self.policy)
 
-        self.device = policy_specs.device
-        self.policy_type = policy_specs.policy_type
-        self.lerobot_features = policy_specs.lerobot_features
-        self.actions_per_chunk = policy_specs.actions_per_chunk
+        # 2. VLM이 결정한 어댑터로 즉시 스위칭 (Hot-swapping)
+        if target_adapter_idx is not None:
+            self.adapter_manager.switch(target_adapter_idx)
 
-        policy_class = get_policy_class(self.policy_type)
-    
-        start = time.perf_counter()
-        # 모델 인스턴스 생성
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
-        self.policy.to(self.device)
-
-        # 전/후처리기 설정
-        device_override = {"device": self.device}
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.policy.config,
-            pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
-            postprocessor_overrides={"device_processor": device_override},
-        )
-    
-        # 매니저에 현재 로드된 정책 객체 등록
-        self.adapter_manager.set_policy(self.policy)
-
-        end = time.perf_counter()
-        self.logger.info(f"모델 로드 완료: {end - start:.4f}초 소요")
-
+        # 3. 인스트럭션 텍스트는 내부 상태로 저장 (추후 추론 시 사용)
+        self.current_instruction = instruction_text
+        
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802

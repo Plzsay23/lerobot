@@ -512,52 +512,38 @@ def async_client(cfg: RobotClientConfig):
     # 2. 메인 루프 (입력 -> 실행 -> 중단 -> 반복)
     while True:
         try:
-            print("\n[상태] 명령 대기 중 (숫자: 어댑터 교체, 문자열: 태스크 시작, exit: 종료)")
+            print("\n[VLM 대기] 태스크를 입력하세요 (형식: '[번호] [내용]', 예: '1 pick up')")
             user_input = input(">>> ").strip()
-            
+        
             if user_input.lower() in ["exit", "quit"]:
-                print("시스템을 종료합니다.")
                 break
-            
             if not user_input:
                 continue
 
-            # 1. 어댑터 교체 모드 (숫자만 입력한 경우)
-            if user_input.isdigit():
-                print(f"🔄 어댑터 {user_input}번으로 교체 명령을 전송합니다...")
-                # 임시 클라이언트를 생성하여 서버에 숫자(인덱스)만 전달
-                cfg.pretrained_name_or_path = user_input
-                temp_client = RobotClient(cfg, robot=shared_robot)
-                if temp_client.start():
-                    print(f"✅ 서버 어댑터 교체 성공.")
-                temp_client.shutdown_event.set()
-                temp_client.channel.close()
-                continue # 다시 입력 대기로 돌아감
-
-            # 2. 일반 태스크 실행 모드 (문자열 입력 시)
-            cfg.task = user_input
-            print(f"🚀 실행 태스크: '{user_input}' (중단: Ctrl + C)")
+            # 모든 입력을 pretrained_name_or_path로 실어 보냄
+            # 서버의 SendPolicyInstructions가 이를 해석하여 어댑터를 바꿈
+            cfg.pretrained_name_or_path = user_input
+            cfg.task = user_input # 인스트럭션으로도 저장
+        
+            print(f"📡 VLM에 명령 전송 중: '{user_input}'")
 
             client = RobotClient(cfg, robot=shared_robot)
             client.set_instruction(user_input)
 
             if client.start():
+                # 서버에서 어댑터 교체가 완료된 후 즉시 실행 루프 진입
                 action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
                 action_receiver_thread.start()
 
                 try:
-                    # 실제 로봇 제어 루프 진입
                     client.control_loop(task=user_input)
                 except KeyboardInterrupt:
-                    print("\n🛑 동작 중단! 다음 명령을 기다립니다.")
+                    print("\n🛑 실행 중단. 다음 명령 대기...")
                 finally:
-                    client.shutdown_event.set()
-                    client.channel.close()
-                    if action_receiver_thread.is_alive():
-                        action_receiver_thread.join(timeout=1.0)
-                        
+                    client.stop_session() # 통신 종료 로직 (로봇은 유지)
+                
         except Exception as e:
-            print(f"❌ 실행 중 오류 발생: {e}")
+            print(f"❌ 에러: {e}")
             
     # 프로그램 종료 시 로봇 연결 해제
     if 'shared_robot' in locals():
