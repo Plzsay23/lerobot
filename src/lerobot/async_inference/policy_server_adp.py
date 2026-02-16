@@ -164,6 +164,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         if not self.running: return services_pb2.Empty()
         policy_specs = pickle.loads(request.data)
         instr = str(policy_specs.pretrained_name_or_path).strip()
+
+        if policy_specs.lerobot_features:
+            self.lerobot_features = policy_specs.lerobot_features
+            self.logger.info(f"✅ 로봇 특징 로드 완료: {list(self.lerobot_features.keys())}")
         
         target_adapter_idx = None
         if " " in instr:
@@ -178,6 +182,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             # 2. [핵심] 통계치 강제 업데이트 로직
             env_key = f"ADP{target_adapter_idx}"
             adapter_name = os.getenv(env_key)
+
+            if not adapter_name:
+                self.logger.error(f"❌ 환경 변수 {env_key}가 설정되지 않았습니다! export {env_key}='이름'을 확인하세요.")
+                return services_pb2.Empty()
+
             # 어댑터 학습 시 사용된 stats.json 경로 (보통 어댑터 폴더 내에 있음)
             stats_path = f"./adapter/{adapter_name}/stats.json" 
             
@@ -185,6 +194,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 import json
                 with open(stats_path, "r") as f:
                     new_stats = json.load(f)
+
+                if self.postprocessor and hasattr(self.postprocessor, 'processors'):
+                    for p in self.postprocessor.processors:
+                        if hasattr(p, 'stats'):
+                            p.stats = {k: torch.tensor(v).to(self.device) for k, v in new_stats.items()}
+                            self.logger.info(f"🔥 [SUCCESS] '{adapter_name}'의 각도 데이터(stats) 주입 완료!")
                 
                 # Postprocessor 내부의 mean/std 값을 어댑터용으로 강제 교체
                 # 'unnormalize' 단계의 파라미터를 직접 건드립니다.
