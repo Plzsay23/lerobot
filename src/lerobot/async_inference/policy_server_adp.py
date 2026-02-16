@@ -361,36 +361,28 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """추론 전과정의 텐서 타입을 추적하여 범인을 검거합니다."""
+        """Autocast를 사용하여 내부 타입 충돌을 원천 차단합니다."""
         try:
-            # 1. 원본 데이터 타입 확인
+            # 1. 원본 데이터 준비 (Raw -> Dict)
             obs_raw = observation_t.get_observation()
-            
             observation = raw_observation_to_observation(
                 obs_raw, self.lerobot_features, self.policy_image_features,
             )
             
             with torch.inference_mode():
-                # 전처리 직후 타입 확인
+                # 2. 전처리 (Float32 유지)
                 observation = self.preprocessor(observation)
-                for k, v in observation.items():
-                    if isinstance(v, torch.Tensor):
-                        self.logger.info(f"🔍 [PRE] Key: {k}, Dtype: {v.dtype}")
-
-                # 모델 입력 직전 강제 캐스팅 및 확인
-                for k, v in observation.items():
-                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
-                        observation[k] = v.to(dtype=torch.bfloat16)
                 
-                # 2. 모델 추론
-                action_tensor = self.policy.predict_action_chunk(observation)
-                self.logger.info(f"🔍 [MODEL OUT] Dtype: {action_tensor.dtype}")
-
-                # 3. 후처리 전 'Float32' 강제 변환 및 확인
+                # 3. 모델 추론 (Autocast 영역)
+                # 여기서 device_type을 'cuda'로 지정하고 dtype을 bfloat16으로 설정하면,
+                # 내부 연산 중 타입 충돌(matmul 에러)을 파이토치가 자동으로 해결합니다.
+                with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
+                    action_tensor = self.policy.predict_action_chunk(observation)
+                
+                # 4. 후처리를 위해 즉시 Float32로 복구
                 action_tensor = action_tensor.to(dtype=torch.float32)
-                self.logger.info(f"🔍 [POST CAST] Dtype: {action_tensor.dtype}")
 
-                # 4. 차원 슬라이싱 및 후처리
+                # 5. 차원 슬라이싱 및 후처리
                 actual_dim = 6
                 if self.lerobot_features and "action" in self.lerobot_features:
                     actual_dim = len(self.lerobot_features["action"])
@@ -400,12 +392,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 processed_actions = []
                 for i in range(action_tensor.shape[1]):
                     single_action = action_tensor[:, i, :]
-                    # 여기서 에러 날 확률 높음: postprocessor 내부 통계값 dtype 확인
                     processed_action = self.postprocessor(single_action)
                     processed_actions.append(processed_action)
                 
                 final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
-                self.logger.info(f"🔍 [FINAL CHUNK] Dtype: {final_chunk.dtype}")
+                
+                # 통계 로그 출력
+                act_max = final_chunk.abs().max().item()
+                self.logger.info(f"✅ [SUCCESS] Action Generated | Max: {act_max:.4f}")
 
                 return self._time_action_chunk(
                     observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep()
