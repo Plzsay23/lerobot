@@ -422,6 +422,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 
                 final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
 
+                final_chunk = final_chunk * 50.0
+
                 final_vals = final_chunk[0].tolist() 
                 self.logger.info(f"🚨 [DEBUG-SERVER] Final Action (J1-J6): {[f'{x:.4f}' for x in final_vals[:6]]}")
                 
