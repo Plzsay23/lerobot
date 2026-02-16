@@ -103,37 +103,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.info(f"🚀 [VRAM INIT] 베이스 모델 상주 시작: {base_model_path}")
         
         try:
-            from lerobot.policies.xvla.configuration_xvla import XVLAConfig
-            import json
-            import inspect
-            from huggingface_hub import hf_hub_download
-            
-            # 1. 실제 config.json 다운로드 및 로드
-            config_file = hf_hub_download(repo_id=base_model_path, filename="config.json")
-            with open(config_file, "r") as f:
-                config_dict = json.load(f)
-            
-            # 2. [핵심] XVLAConfig 클래스에 정의된 필드만 필터링 (가장 안전한 방법)
-            # 클래스의 __init__ 인자 목록을 가져와서 딕셔너리와 매칭되는 것만 남깁니다.
-            sig = inspect.signature(XVLAConfig.__init__)
-            valid_params = [p.name for p in sig.parameters.values() if p.name != 'self']
-            
-            # 클래스 정의에 있는 키값만 골라내어 새로운 딕셔너리 생성
-            filtered_config = {k: v for k, v in config_dict.items() if k in valid_params}
-            
-            # 3. 필수 설정값 강제 주입
-            config = XVLAConfig(**filtered_config)
-            config.num_denoising_steps = 3  # 실시간 속도 최적화
-            # 만약 차원 에러가 날 경우를 대비해 여기서 6으로 테스트해볼 수도 있습니다.
-            # config.max_action_dim = 6 
-            
-            # 4. 모델 로드 (bfloat16 적용)
+            # 1. 정책 클래스를 가져옵니다.
             policy_class = get_policy_class(self.policy_type)
+
+            # 2. [수정] 수동 config 조작 없이, 라이브러리 표준 방식으로 먼저 로드합니다.
+            # dtype="bfloat16"을 주면 램 점유와 연산 속도를 모두 잡을 수 있습니다.
             self.policy = policy_class.from_pretrained(
                 base_model_path, 
-                config=config,
-                dtype="bfloat16" # 하프 프리시전 강제
+                dtype="bfloat16" 
             )
+            
+            # 3. 로드된 모델 객체에서 직접 설정을 덮어씌웁니다. (에러 방지 핵심)
+            self.policy.config.num_denoising_steps = 3
+            
             self.policy.to(self.device)
             self.policy.eval()
             
@@ -141,6 +123,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             param_dtype = next(self.policy.parameters()).dtype
             vram_usage = torch.cuda.memory_allocated(self.device) / 1024**2
             self.logger.info(f"🔍 [MODEL CHECK] Dtype: {param_dtype} | VRAM: {vram_usage:.2f}MB")
+            self.logger.info(f"⚡ [SPEED CHECK] Denoising Steps: {self.policy.config.num_denoising_steps}")
             
             # 전/후처리기 초기화
             device_override = {"device": self.device}
@@ -152,11 +135,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             )
             
             self.adapter_manager.set_policy(self.policy)
-            self.logger.info("✅ 베이스 모델 및 프로세서 상주 완료.")
+            self.logger.info("✅ 베이스 모델 상주 완료.")
             
         except Exception as e:
             self.logger.error(f"❌ 초기화 실패: {e}")
-            # 에러 발생 시 상세 트레이스백을 찍어서 원인을 파악합니다.
             import traceback
             self.logger.error(traceback.format_exc())
 
