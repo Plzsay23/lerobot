@@ -187,8 +187,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # 3. [최적화] 명령이 올 때만 어댑터 교체 수행
         if target_adapter_idx is not None:
             start_switch = time.perf_counter()
+            # 1. 어댑터 가중치 교체
             self.adapter_manager.switch(target_adapter_idx)
-            self.logger.info(f"🔄 어댑터 {target_adapter_idx}번 교체 완료 ({time.perf_counter()-start_switch:.4f}s)")
+            
+            # 2. [추가] 해당 어댑터의 경로를 가져와서 Postprocessor 재설정
+            # 어댑터 폴더 내의 stats.json을 기반으로 물리량 단위를 복원하게 만듭니다.
+            adapter_name = self.adapter_manager.adapter_names.get(target_adapter_idx)
+            adapter_path = f"./adapter/{adapter_name}" # 실제 경로에 맞춰 조정
+            
+            device_override = {"device": self.device}
+            # 전처리/후처리기를 해당 어댑터 기준으로 다시 생성합니다.
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                self.policy.config,
+                pretrained_path=adapter_path, # 베이스가 아닌 어댑터 경로 사용
+                preprocessor_overrides={"device_processor": device_override},
+                postprocessor_overrides={"device_processor": device_override},
+            )
+            
+            self.logger.info(f"🔄 어댑터 {target_adapter_idx}번 및 통계치 교체 완료 ({time.perf_counter()-start_switch:.4f}s)")
 
         self.current_instruction = instruction_text
         return services_pb2.Empty()
