@@ -354,9 +354,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
+        """추론 전과정을 디버깅하고 타입 충돌을 방지합니다."""
         t_start = time.perf_counter()
 
-        # 1. 전처리 (이 단계는 Float32로 안전하게 수행)
+        # 1. 데이터 준비 및 전처리 (Float32로 수행)
         observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
@@ -365,7 +366,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with torch.inference_mode():
             observation = self.preprocessor(observation)
         
-        # [중요] 모델 입력을 bfloat16으로 변환
+        # [핵심] 모델 입력을 bfloat16으로 캐스팅 (모델이 bfloat16이므로)
         for k, v in observation.items():
             if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
                 observation[k] = v.to(dtype=torch.bfloat16)
@@ -376,12 +377,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with torch.inference_mode():
             action_tensor = self.policy.predict_action_chunk(observation)
         
-        # [중요] 후처리를 위해 즉시 float32로 복구
-        action_tensor = action_tensor.to(dtype=torch.float)
+        # [핵심] 후처리를 위해 즉시 float32(Float)로 복구
+        # 이 단계가 빠지면 StreamActions에서 Float expect 에러가 납니다.
+        action_tensor = action_tensor.to(dtype=torch.float32)
         
         t_inference = time.perf_counter()
 
-        # 3. 차원 슬라이싱 및 후처리 (이제 Float32라 안전함)
+        # 3. 차원 슬라이싱 및 후처리 (Float32에서 수행)
         actual_dim = 6 
         if self.lerobot_features and "action" in self.lerobot_features:
             actual_dim = len(self.lerobot_features["action"])
@@ -392,13 +394,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         with torch.inference_mode():
             for i in range(action_tensor.shape[1]):
                 single_action = action_tensor[:, i, :]
+                # 후처리기는 이제 Float32 데이터를 받으므로 안전합니다.
                 processed_action = self.postprocessor(single_action)
                 processed_actions.append(processed_action)
         
         action_tensor = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
         t_post = time.perf_counter()
 
-        # 데이터 모니터링
+        # 데이터 모니터링 로그
         act_max = action_tensor.abs().max().item()
         self.logger.info(
             f"⏱️ [Total {1000*(t_post-t_start):.1f}ms] "
