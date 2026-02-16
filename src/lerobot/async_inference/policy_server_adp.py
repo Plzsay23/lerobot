@@ -103,26 +103,41 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.info(f"🚀 [VRAM INIT] 베이스 모델 상주 시작: {base_model_path}")
         
         try:
-            # XVLAConfig를 직접 조작하여 bfloat16과 Steps 강제 설정
             from lerobot.policies.xvla.configuration_xvla import XVLAConfig
-            config = XVLAConfig.from_pretrained(base_model_path)
-            config.num_denoising_steps = 3  # 속도 최적화의 핵심
+            
+            # [에러 해결] config 로드 시 유효하지 않은 필드(type 등) 무시 처리
+            # .from_pretrained 내부에서 발생하는 pydantic/draccus 유효성 검사 에러를 방지합니다.
+            import json
+            from huggingface_hub import hf_hub_download
+            
+            # 실제 config 파일을 다운로드하여 딕셔너리로 읽음
+            config_file = hf_hub_download(repo_id=base_model_path, filename="config.json")
+            with open(config_file, "r") as f:
+                config_dict = json.load(f)
+            
+            # 에러를 유발하는 'type' 필드 강제 제거
+            if "type" in config_dict:
+                config_dict.pop("type")
+                
+            # 정리된 딕셔너리로 XVLAConfig 생성
+            config = XVLAConfig(**config_dict)
+            config.num_denoising_steps = 3  # 속도 최적화
             
             policy_class = get_policy_class(self.policy_type)
             self.policy = policy_class.from_pretrained(
                 base_model_path, 
                 config=config,
-                dtype="bfloat16" # 하프 프리시전 강제 적용
+                dtype="bfloat16" # 하프 프리시전 강제
             )
             self.policy.to(self.device)
             self.policy.eval()
             
-            # [디버깅] 실제 로드된 모델의 정밀도 확인
+            # Dtype 확인 로그
             param_dtype = next(self.policy.parameters()).dtype
             vram_usage = torch.cuda.memory_allocated(self.device) / 1024**2
             self.logger.info(f"🔍 [MODEL CHECK] Dtype: {param_dtype} | VRAM: {vram_usage:.2f}MB")
             
-            # 전/후처리기 초기화
+            # 프로세서 초기화
             device_override = {"device": self.device}
             self.preprocessor, self.postprocessor = make_pre_post_processors(
                 self.policy.config,
