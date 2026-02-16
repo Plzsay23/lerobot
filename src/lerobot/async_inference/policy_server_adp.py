@@ -98,32 +98,25 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._initialize_base_model()
 
     def _initialize_base_model(self):
-        """서버 기동 시 베이스 모델을 VRAM에 상주시키고 타입을 점검합니다."""
         base_model_path = os.getenv("BASE_MODEL", "lerobot/xvla-base")
-        self.logger.info(f"🚀 [VRAM INIT] 베이스 모델 상주 시작: {base_model_path}")
+        self.logger.info(f"🚀 [VRAM INIT] {base_model_path}")
         
         try:
-            # 1. 정책 클래스를 가져옵니다.
             policy_class = get_policy_class(self.policy_type)
-
-            # 2. [수정] 수동 config 조작 없이, 라이브러리 표준 방식으로 먼저 로드합니다.
-            # dtype="bfloat16"을 주면 램 점유와 연산 속도를 모두 잡을 수 있습니다.
-            self.policy = policy_class.from_pretrained(
-                base_model_path, 
-                dtype="bfloat16" 
-            )
+            # 1. 모델 로드 시도
+            self.policy = policy_class.from_pretrained(base_model_path)
             
-            # 3. 로드된 모델 객체에서 직접 설정을 덮어씌웁니다. (에러 방지 핵심)
+            # 2. [강제 전환] 모델 전체를 bfloat16으로 즉시 변경
+            self.policy.to(device=self.device, dtype=torch.bfloat16)
+            
+            # 3. Steps 강제 고정
             self.policy.config.num_denoising_steps = 3
-            
-            self.policy.to(self.device)
             self.policy.eval()
-            
-            # [디버깅] 실제 로드된 모델의 상태 확인
+
+            # [디버깅 로그 재확인]
             param_dtype = next(self.policy.parameters()).dtype
             vram_usage = torch.cuda.memory_allocated(self.device) / 1024**2
-            self.logger.info(f"🔍 [MODEL CHECK] Dtype: {param_dtype} | VRAM: {vram_usage:.2f}MB")
-            self.logger.info(f"⚡ [SPEED CHECK] Denoising Steps: {self.policy.config.num_denoising_steps}")
+            self.logger.info(f"🔍 [FIXED CHECK] Dtype: {param_dtype} | VRAM: {vram_usage:.2f}MB")
             
             # 전/후처리기 초기화
             device_override = {"device": self.device}
