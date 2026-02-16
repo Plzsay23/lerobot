@@ -386,7 +386,7 @@ class RobotClient:
         
             # [디버깅] 로봇에 전달되는 실제 값 확인
             action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
-            self.logger.debug(f"🤖 로봇에게 전송되는 액션값: {action_dict}")
+            self.logger.info(f"🤖 [DEBUG-CLIENT] Target to Robot: {action_dict}")
         
             _performed_action = self.robot.send_action(action_dict)
         

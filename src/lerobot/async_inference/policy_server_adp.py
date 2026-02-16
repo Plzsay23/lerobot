@@ -382,6 +382,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 # 4. 후처리를 위해 즉시 Float32로 복구
                 action_tensor = action_tensor.to(dtype=torch.float32)
 
+                raw_max = action_tensor.abs().max().item()
+                raw_mean = action_tensor.mean().item()
+                self.logger.info(f"🔍 [DEBUG-SERVER] Raw Output - Max: {raw_max:.4f}, Mean: {raw_mean:.4f}")
+
                 # 5. 차원 슬라이싱 및 후처리
                 actual_dim = 6
                 if self.lerobot_features and "action" in self.lerobot_features:
@@ -396,6 +400,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     processed_actions.append(processed_action)
                 
                 final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
+
+                final_vals = final_chunk[0].tolist() 
+                self.logger.info(f"🚨 [DEBUG-SERVER] Final Action (J1-J6): {[f'{x:.4f}' for x in final_vals[:6]]}")
                 
                 # 통계 로그 출력
                 act_max = final_chunk.abs().max().item()
