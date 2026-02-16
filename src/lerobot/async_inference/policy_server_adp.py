@@ -235,31 +235,42 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def GetActions(self, request, context):  # noqa: N802
-        """Returns actions to the robot client. Actions are sent as a single
-        chunk, containing multiple actions."""
+        """클라이언트에게 액션 청크를 반환합니다. Dtype 충돌을 정밀 수사합니다."""
         client_id = context.peer()
         self.logger.debug(f"Client {client_id} connected for action streaming")
 
-        # Generate action based on the most recent observation and its timestep
         try:
             getactions_starts = time.perf_counter()
             obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
-            self.logger.info(
-                f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
-            )
-
+            
             with self._predicted_timesteps_lock:
                 self._predicted_timesteps.add(obs.get_timestep())
 
+            # 1. 추론 수행 (내부에서 BFloat16 -> Float32 변환 수행됨)
             start_time = time.perf_counter()
             action_chunk = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
 
+            # 2. [범인 검거] 직렬화 직전 리스트 내 텐서 타입 전수 조사
+            if action_chunk and len(action_chunk) > 0:
+                # 첫 번째 액션의 실제 데이터 확인
+                sample_act = action_chunk[0].action # TimedAction.action 접근
+                
+                if torch.is_tensor(sample_act):
+                    self.logger.info(f"🚨 [DTYPE CHECK] 최종 송신 텐서 타입: {sample_act.dtype}")
+                    
+                    # 만약 여전히 bfloat16이면 여기서 강제로 float32로 교정 (최후의 보루)
+                    if sample_act.dtype == torch.bfloat16:
+                        self.logger.warning("⚠️ BFloat16 발견! 피클 직렬화 전 Float32로 강제 변환합니다.")
+                        for ta in action_chunk:
+                            if torch.is_tensor(ta.action):
+                                ta.action = ta.action.to(torch.float32)
+
+            # 3. 직렬화 및 전송
             start_time = time.perf_counter()
-            actions_bytes = pickle.dumps(action_chunk)  # nosec
+            actions_bytes = pickle.dumps(action_chunk)
             serialize_time = time.perf_counter() - start_time
 
-            # Create and return the action chunk
             actions = services_pb2.Actions(data=actions_bytes)
 
             self.logger.info(
@@ -267,25 +278,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Total time: {(inference_time + serialize_time) * 1000:.2f}ms"
             )
 
-            self.logger.debug(
-                f"Action chunk #{obs.get_timestep()} generated | "
-                f"Inference time: {inference_time:.2f}s |"
-                f"Serialize time: {serialize_time:.2f}s |"
-                f"Total time: {inference_time + serialize_time:.2f}s"
-            )
-
+            # 지연 시간 조절
             time.sleep(
                 max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
-            )  # sleep controls inference latency
+            )
 
             return actions
 
-        except Empty:  # no observation added to queue in obs_queue_timeout
+        except Empty:
             return services_pb2.Empty()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
-
+            # 에러 발생 시 상세 정보 출력
+            self.logger.error(f"💥 GetActions 에러 발생: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return services_pb2.Empty()
 
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
@@ -354,63 +361,60 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """추론 전과정을 디버깅하고 타입 충돌을 방지합니다."""
-        t_start = time.perf_counter()
+        """추론 전과정의 텐서 타입을 추적하여 범인을 검거합니다."""
+        try:
+            # 1. 원본 데이터 타입 확인
+            obs_raw = observation_t.get_observation()
+            
+            observation = raw_observation_to_observation(
+                obs_raw, self.lerobot_features, self.policy_image_features,
+            )
+            
+            with torch.inference_mode():
+                # 전처리 직후 타입 확인
+                observation = self.preprocessor(observation)
+                for k, v in observation.items():
+                    if isinstance(v, torch.Tensor):
+                        self.logger.info(f"🔍 [PRE] Key: {k}, Dtype: {v.dtype}")
 
-        # 1. 데이터 준비 및 전처리 (Float32로 수행)
-        observation = raw_observation_to_observation(
-            observation_t.get_observation(),
-            self.lerobot_features,
-            self.policy_image_features,
-        )
-        with torch.inference_mode():
-            observation = self.preprocessor(observation)
-        
-        # [핵심] 모델 입력을 bfloat16으로 캐스팅 (모델이 bfloat16이므로)
-        for k, v in observation.items():
-            if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
-                observation[k] = v.to(dtype=torch.bfloat16)
-        
-        t_preprocess = time.perf_counter()
+                # 모델 입력 직전 강제 캐스팅 및 확인
+                for k, v in observation.items():
+                    if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                        observation[k] = v.to(dtype=torch.bfloat16)
+                
+                # 2. 모델 추론
+                action_tensor = self.policy.predict_action_chunk(observation)
+                self.logger.info(f"🔍 [MODEL OUT] Dtype: {action_tensor.dtype}")
 
-        # 2. 순수 모델 추론 (bfloat16 연산)
-        with torch.inference_mode():
-            action_tensor = self.policy.predict_action_chunk(observation)
-        
-        # [핵심] 후처리를 위해 즉시 float32(Float)로 복구
-        # 이 단계가 빠지면 StreamActions에서 Float expect 에러가 납니다.
-        action_tensor = action_tensor.to(dtype=torch.float32)
-        
-        t_inference = time.perf_counter()
+                # 3. 후처리 전 'Float32' 강제 변환 및 확인
+                action_tensor = action_tensor.to(dtype=torch.float32)
+                self.logger.info(f"🔍 [POST CAST] Dtype: {action_tensor.dtype}")
 
-        # 3. 차원 슬라이싱 및 후처리 (Float32에서 수행)
-        actual_dim = 6 
-        if self.lerobot_features and "action" in self.lerobot_features:
-            actual_dim = len(self.lerobot_features["action"])
-        
-        action_tensor = action_tensor[:, :, :actual_dim]
+                # 4. 차원 슬라이싱 및 후처리
+                actual_dim = 6
+                if self.lerobot_features and "action" in self.lerobot_features:
+                    actual_dim = len(self.lerobot_features["action"])
+                
+                action_tensor = action_tensor[:, :, :actual_dim]
 
-        processed_actions = []
-        with torch.inference_mode():
-            for i in range(action_tensor.shape[1]):
-                single_action = action_tensor[:, i, :]
-                # 후처리기는 이제 Float32 데이터를 받으므로 안전합니다.
-                processed_action = self.postprocessor(single_action)
-                processed_actions.append(processed_action)
-        
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
-        t_post = time.perf_counter()
+                processed_actions = []
+                for i in range(action_tensor.shape[1]):
+                    single_action = action_tensor[:, i, :]
+                    # 여기서 에러 날 확률 높음: postprocessor 내부 통계값 dtype 확인
+                    processed_action = self.postprocessor(single_action)
+                    processed_actions.append(processed_action)
+                
+                final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
+                self.logger.info(f"🔍 [FINAL CHUNK] Dtype: {final_chunk.dtype}")
 
-        # 데이터 모니터링 로그
-        act_max = action_tensor.abs().max().item()
-        self.logger.info(
-            f"⏱️ [Total {1000*(t_post-t_start):.1f}ms] "
-            f"Inf: {1000*(t_inference-t_preprocess):.1f}ms | Max: {act_max:.4f}"
-        )
-
-        return self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
-        )
+                return self._time_action_chunk(
+                    observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep()
+                )
+        except Exception as e:
+            self.logger.error(f"❌ [CRITICAL] _predict_action_chunk failed: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            raise e
 
     def stop(self):
         """Stop the server"""
