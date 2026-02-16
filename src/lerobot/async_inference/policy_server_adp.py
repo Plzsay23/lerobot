@@ -98,21 +98,31 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._initialize_base_model()
 
     def _initialize_base_model(self):
-        """서버 시작 시 베이스 모델을 bfloat16 정밀도로 VRAM에 로드하여 상주시킵니다."""
+        """서버 기동 시 베이스 모델을 VRAM에 상주시키고 타입을 점검합니다."""
         base_model_path = os.getenv("BASE_MODEL", "lerobot/xvla-base")
-        self.logger.info(f"🚀 [INIT] 베이스 모델 VRAM 상주 시작 (bfloat16): {base_model_path}")
+        self.logger.info(f"🚀 [VRAM INIT] 베이스 모델 상주 시작: {base_model_path}")
         
         try:
-            # 정책 클래스 확보 및 모델 로드
+            # XVLAConfig를 직접 조작하여 bfloat16과 Steps 강제 설정
+            from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+            config = XVLAConfig.from_pretrained(base_model_path)
+            config.num_denoising_steps = 3  # 속도 최적화의 핵심
+            
             policy_class = get_policy_class(self.policy_type)
             self.policy = policy_class.from_pretrained(
                 base_model_path, 
-                dtype="bfloat16" # 하프 프리시전 강제
+                config=config,
+                dtype="bfloat16" # 하프 프리시전 강제 적용
             )
             self.policy.to(self.device)
-            self.policy.eval() # 추론 모드 설정
+            self.policy.eval()
             
-            # 기본 전/후처리기 생성 (장치 최적화)
+            # [디버깅] 실제 로드된 모델의 정밀도 확인
+            param_dtype = next(self.policy.parameters()).dtype
+            vram_usage = torch.cuda.memory_allocated(self.device) / 1024**2
+            self.logger.info(f"🔍 [MODEL CHECK] Dtype: {param_dtype} | VRAM: {vram_usage:.2f}MB")
+            
+            # 전/후처리기 초기화
             device_override = {"device": self.device}
             self.preprocessor, self.postprocessor = make_pre_post_processors(
                 self.policy.config,
@@ -121,13 +131,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 postprocessor_overrides={"device_processor": device_override},
             )
             
-            # 매니저에 상주된 정책 객체 전달
             self.adapter_manager.set_policy(self.policy)
-            self.policy.config.num_denoising_steps = 3 
-            self.logger.info("✅ Denoising steps set to 3 for real-time performance.")
-            self.logger.info("✅ 베이스 모델 및 기본 프로세서 VRAM 상주 완료.")
+            self.logger.info("✅ 베이스 모델 및 프로세서 상주 완료.")
         except Exception as e:
-            self.logger.error(f"❌ 베이스 모델 상주 실패: {e}")
+            self.logger.error(f"❌ 초기화 실패: {e}")
 
     @property
     def running(self):
@@ -155,14 +162,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):
-        """클라이언트의 새 명령(어댑터 번호 + 텍스트)을 처리합니다."""
+        """클라이언트 명령 수신 시 어댑터를 핫스왑합니다. (추론 루프와 분리)"""
         if not self.running:
             return services_pb2.Empty()
 
         policy_specs = pickle.loads(request.data)
         instr = str(policy_specs.pretrained_name_or_path).strip()
         
-        # 1. 입력 문자열 해석 ('1 pick up' -> ID: 1, Text: 'pick up')
+        # 1. 입력 해석 ('1 pick up')
         target_adapter_idx = None
         instruction_text = instr
         if " " in instr:
@@ -174,21 +181,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             target_adapter_idx = int(instr)
             instruction_text = "default task"
 
-        # 2. 메타데이터 업데이트 (필요 시)
+        # 2. 메타데이터 업데이트
         self.lerobot_features = policy_specs.lerobot_features or self.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk or self.actions_per_chunk
 
-        # 3. [병목 제거] 명령이 왔을 때만 어댑터를 갈아끼웁니다.
+        # 3. [최적화] 명령이 올 때만 어댑터 교체 수행
         if target_adapter_idx is not None:
             start_switch = time.perf_counter()
             self.adapter_manager.switch(target_adapter_idx)
-            switch_time = time.perf_counter() - start_switch
-            self.logger.info(f"🔄 어댑터 {target_adapter_idx}번으로 교체 완료 ({switch_time:.4f}s)")
+            self.logger.info(f"🔄 어댑터 {target_adapter_idx}번 교체 완료 ({time.perf_counter()-start_switch:.4f}s)")
 
-        # 4. 텍스트 명령어 저장
         self.current_instruction = instruction_text
-        self.logger.info(f"📡 새 태스크 설정: '{instruction_text}'")
-        
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
@@ -352,80 +355,62 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """순수하게 추론 연산만 수행합니다. (어댑터 교체 로직 없음)"""
-        
-        # 1. 관측치 데이터 준비
-        start_prepare = time.perf_counter()
-        observation: Observation = raw_observation_to_observation(
+        """추론 전과정을 디버깅하고 차원을 슬라이싱합니다."""
+        t_start = time.perf_counter()
+
+        # 1. 데이터 준비
+        observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
         )
-        prepare_time = time.perf_counter() - start_prepare
+        t_prepare = time.perf_counter()
 
-        # 2. 전처리 및 추론 (병목 감시 로그 포함)
-        start_inference = time.perf_counter()
-        
-        # [디버깅] 현재 설정된 Denoising Steps 확인
-        current_steps = self.policy.config.num_denoising_steps
-        
-        with torch.inference_mode(): #
-            # 전처리
-            observation = self.preprocessor(observation)
-            
-            # 모델 추론 (어댑터는 이미 상주된 상태로 연산만 수행)
-            action_tensor = self._get_action_chunk(observation)
-            
-        inference_time = time.perf_counter() - start_inference
-        
-        # [성능 모니터링] Steps와 시간을 함께 출력
-        self.logger.info(
-            f"🚀 [Steps: {current_steps}] Inference took {inference_time:.4f}s | "
-            f"Shape: {action_tensor.shape}"
-        )
-
-        # 3. 후처리 및 TimedAction 변환
-        start_postprocess = time.perf_counter()
-        _, chunk_size, _ = action_tensor.shape
-
-        processed_actions = []
+        # 2. 전처리 (Dtype 감시)
         with torch.inference_mode():
-            for i in range(chunk_size):
-                single_action = action_tensor[:, i, :]
-                processed_action = self.postprocessor(single_action)
-                processed_actions.append(processed_action)
+            observation = self.preprocessor(observation)
+        t_preprocess = time.perf_counter()
 
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
-        action_tensor = action_tensor.detach().cpu()
+        # 3. 순수 모델 추론
+        with torch.inference_mode():
+            # 실제 모델이 뱉는 raw 텐서 (1, 30, 20)
+            action_tensor = self.policy.predict_action_chunk(observation)
+        t_inference = time.perf_counter()
 
-        action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
-        )
-
-        """4. Apply postprocessor & Slicing"""
-        start_postprocess = time.perf_counter()
+        # 4. 차원 슬라이싱 (20 -> 6) 및 후처리
+        actual_dim = 6 # 기본값 6자유도
+        if self.lerobot_features and "action" in self.lerobot_features:
+            actual_dim = len(self.lerobot_features["action"])
         
-        # 모델의 20차원 출력에서 로봇의 실제 차원(예: 6)만 추출
-        actual_dim = len(self.lerobot_features.get("action", [])) or 6 
-        action_tensor = action_tensor[:, :, :actual_dim] # [1, 30, 20] -> [1, 30, 6]
-        
-        self.logger.debug(f"Sliced action shape for robot: {action_tensor.shape}")
+        # [핵심] 로봇 규격에 맞춰 강제 절단
+        action_tensor = action_tensor[:, :, :actual_dim]
 
         processed_actions = []
         with torch.inference_mode():
             for i in range(action_tensor.shape[1]):
                 single_action = action_tensor[:, i, :]
-                # 후처리기가 6차원 데이터를 처리하도록 함
                 processed_action = self.postprocessor(single_action)
                 processed_actions.append(processed_action)
-
+        
         action_tensor = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
-        
-        # [중요] 액션 값이 모두 0이거나 너무 작지 않은지 확인 (디버깅용)
-        if torch.abs(action_tensor).max() < 1e-5:
-            self.logger.warning("⚠️ 경고: 생성된 액션 값이 거의 0입니다. 모델이 정지 상태를 출력 중입니다.")
-        
-        return action_chunk
+        t_post = time.perf_counter()
+
+        # 5. [성능/데이터 모니터링] 로봇이 안 움직이는 원인 파악용 로그
+        act_max = action_tensor.abs().max().item()
+        self.logger.info(
+            f"⏱️ [Total {1000*(t_post-t_start):.1f}ms] "
+            f"Prep: {1000*(t_preprocess-t_prepare):.1f}ms | "
+            f"Inf: {1000*(t_inference-t_preprocess):.1f}ms | "
+            f"Post: {1000*(t_post-t_inference):.1f}ms"
+        )
+        self.logger.info(f"📉 [Output] Shape: {action_tensor.shape} | Max Val: {act_max:.4f}")
+
+        if act_max < 1e-4:
+            self.logger.error("❌ 액션 값이 0에 가깝습니다. 어댑터 주입이나 Dtype 변환을 확인하세요.")
+
+        return self._time_action_chunk(
+            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+        )
 
     def stop(self):
         """Stop the server"""

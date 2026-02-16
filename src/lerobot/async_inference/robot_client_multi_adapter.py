@@ -376,38 +376,27 @@ class RobotClient:
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
 
-    def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
-        """Reading and performing actions in local queue"""
-
-        # Lock only for queue operations
-        get_start = time.perf_counter()
-        with self.action_queue_lock:
-            self.action_queue_size.append(self.action_queue.qsize())
-            # Get action from queue
-            timed_action = self.action_queue.get_nowait()
-        get_end = time.perf_counter() - get_start
-
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
-        with self.latest_action_lock:
-            self.latest_action = timed_action.get_timestep()
-
-        if verbose:
+    def control_loop_action(self, verbose: bool = True) -> dict[str, Any]:
+        try:
             with self.action_queue_lock:
-                current_queue_size = self.action_queue.qsize()
-
-            self.logger.debug(
-                f"Ts={timed_action.get_timestamp()} | "
-                f"Action #{timed_action.get_timestep()} performed | "
-                f"Queue size: {current_queue_size}"
-            )
-
-            self.logger.debug(
-                f"Popping action from queue to perform took {get_end:.6f}s | Queue size: {current_queue_size}"
-            )
-
-        return _performed_action
+                if self.action_queue.empty():
+                    self.logger.warning("⚠️ 액션 큐가 비었습니다! 서버 응답을 기다리는 중...")
+                    return None
+                timed_action = self.action_queue.get_nowait()
+        
+            # [디버깅] 로봇에 전달되는 실제 값 확인
+            action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+            self.logger.debug(f"🤖 로봇에게 전송되는 액션값: {action_dict}")
+        
+            _performed_action = self.robot.send_action(action_dict)
+        
+            with self.latest_action_lock:
+                self.latest_action = timed_action.get_timestep()
+            
+            return _performed_action
+        except Exception as e:
+            self.logger.error(f"❌ 로봇 제어 중 오류 발생: {e}")
+        return None
 
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
