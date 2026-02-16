@@ -354,34 +354,38 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """추론 전과정을 디버깅하고 차원을 슬라이싱합니다."""
         t_start = time.perf_counter()
 
-        # 1. 데이터 준비
+        # 1. 전처리 (이 단계는 Float32로 안전하게 수행)
         observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
         )
-        t_prepare = time.perf_counter()
-
-        # 2. 전처리 (Dtype 감시)
         with torch.inference_mode():
             observation = self.preprocessor(observation)
+        
+        # [중요] 모델 입력을 bfloat16으로 변환
+        for k, v in observation.items():
+            if isinstance(v, torch.Tensor) and torch.is_floating_point(v):
+                observation[k] = v.to(dtype=torch.bfloat16)
+        
         t_preprocess = time.perf_counter()
 
-        # 3. 순수 모델 추론
+        # 2. 순수 모델 추론 (bfloat16 연산)
         with torch.inference_mode():
-            # 실제 모델이 뱉는 raw 텐서 (1, 30, 20)
             action_tensor = self.policy.predict_action_chunk(observation)
+        
+        # [중요] 후처리를 위해 즉시 float32로 복구
+        action_tensor = action_tensor.to(dtype=torch.float)
+        
         t_inference = time.perf_counter()
 
-        # 4. 차원 슬라이싱 (20 -> 6) 및 후처리
-        actual_dim = 6 # 기본값 6자유도
+        # 3. 차원 슬라이싱 및 후처리 (이제 Float32라 안전함)
+        actual_dim = 6 
         if self.lerobot_features and "action" in self.lerobot_features:
             actual_dim = len(self.lerobot_features["action"])
         
-        # [핵심] 로봇 규격에 맞춰 강제 절단
         action_tensor = action_tensor[:, :, :actual_dim]
 
         processed_actions = []
@@ -394,18 +398,12 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         action_tensor = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
         t_post = time.perf_counter()
 
-        # 5. [성능/데이터 모니터링] 로봇이 안 움직이는 원인 파악용 로그
+        # 데이터 모니터링
         act_max = action_tensor.abs().max().item()
         self.logger.info(
             f"⏱️ [Total {1000*(t_post-t_start):.1f}ms] "
-            f"Prep: {1000*(t_preprocess-t_prepare):.1f}ms | "
-            f"Inf: {1000*(t_inference-t_preprocess):.1f}ms | "
-            f"Post: {1000*(t_post-t_inference):.1f}ms"
+            f"Inf: {1000*(t_inference-t_preprocess):.1f}ms | Max: {act_max:.4f}"
         )
-        self.logger.info(f"📉 [Output] Shape: {action_tensor.shape} | Max Val: {act_max:.4f}")
-
-        if act_max < 1e-4:
-            self.logger.error("❌ 액션 값이 0에 가깝습니다. 어댑터 주입이나 Dtype 변환을 확인하세요.")
 
         return self._time_action_chunk(
             observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
