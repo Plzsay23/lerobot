@@ -42,8 +42,8 @@ class MultiAdapterManager:
     def verify_adapter_delta(self):
     # 어댑터가 적용된 파라미터와 베이스 파라미터의 차이 확인
     # 만약 모든 차이값이 0에 가깝다면 어댑터가 빈 껍데기일 확률이 높습니다.
-    for name, param in self.policy.named_parameters():
-        if "adapter" in name or "lora" in name:
-            weight_max = param.abs().max().item()
-            weight_mean = param.abs().mean().item()
-            self.logger.info(f"📊 [ADAPTER-CHECK] {name} | Max: {weight_max:.6f} | Mean: {weight_mean:.6f}")
+        for name, param in self.policy.named_parameters():
+            if "adapter" in name or "lora" in name:
+                weight_max = param.abs().max().item()
+                weight_mean = param.abs().mean().item()
+                self.logger.info(f"📊 [ADAPTER-CHECK] {name} | Max: {weight_max:.6f} | Mean: {weight_mean:.6f}")
