@@ -401,6 +401,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 act_max = final_chunk.abs().max().item()
                 self.logger.info(f"✅ [SUCCESS] Action Generated | Max: {act_max:.4f}")
 
+                raw_vals = final_chunk[0].tolist() # 첫 번째 액션 프레임
+                self.logger.info(f"🚨 [REAL-TIME ACTION] J1: {raw_vals[0]:.4f} | J2: {raw_vals[1]:.4f} | J3: {raw_vals[2]:.4f} | G: {raw_vals[5]:.4f}")
+
                 return self._time_action_chunk(
                     observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep()
                 )
