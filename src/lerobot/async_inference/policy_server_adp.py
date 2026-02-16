@@ -161,61 +161,42 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):
-        """클라이언트 명령 수신 시 어댑터와 그에 맞는 통계치(stats)를 함께 교체합니다."""
-        if not self.running:
-            return services_pb2.Empty()
-
+        if not self.running: return services_pb2.Empty()
         policy_specs = pickle.loads(request.data)
         instr = str(policy_specs.pretrained_name_or_path).strip()
         
-        # 1. 입력 해석 ('1 pick up')
         target_adapter_idx = None
-        instruction_text = instr
         if " " in instr:
             parts = instr.split(" ", 1)
-            if parts[0].isdigit():
-                target_adapter_idx = int(parts[0])
-                instruction_text = parts[1]
-        elif instr.isdigit():
-            target_adapter_idx = int(instr)
-            instruction_text = "default task"
+            if parts[0].isdigit(): target_adapter_idx = int(parts[0])
+        elif instr.isdigit(): target_adapter_idx = int(instr)
 
-        # 2. 메타데이터 업데이트
-        self.lerobot_features = policy_specs.lerobot_features or self.lerobot_features
-        self.actions_per_chunk = policy_specs.actions_per_chunk or self.actions_per_chunk
-
-        # 3. 어댑터 및 통계치(Postprocessor) 동시 교체
         if target_adapter_idx is not None:
-            start_switch = time.perf_counter()
-            
-            # (1) 가중치 교체
+            # 1. 어댑터 가중치 스위칭
             self.adapter_manager.switch(target_adapter_idx)
             
-            # (2) [에러 수정] 환경 변수에서 어댑터 이름 직접 가져오기
-            # ADP1, ADP2 등 환경 변수명을 조합하여 폴더명을 알아냅니다.
+            # 2. [핵심] 통계치 강제 업데이트 로직
             env_key = f"ADP{target_adapter_idx}"
             adapter_name = os.getenv(env_key)
+            # 어댑터 학습 시 사용된 stats.json 경로 (보통 어댑터 폴더 내에 있음)
+            stats_path = f"./adapter/{adapter_name}/stats.json" 
             
-            if adapter_name:
-                # 어댑터 폴더 내의 stats.json을 기반으로 Postprocessor 재설정
-                adapter_path = f"./adapter/{adapter_name}" 
+            if os.path.exists(stats_path):
+                import json
+                with open(stats_path, "r") as f:
+                    new_stats = json.load(f)
                 
-                if os.path.exists(adapter_path):
-                    device_override = {"device": self.device}
-                    # 해당 어댑터의 통계치로 전/후처리기를 완전히 새로 만듭니다.
-                    self.preprocessor, self.postprocessor = make_pre_post_processors(
-                        self.policy.config,
-                        pretrained_path=adapter_path,
-                        preprocessor_overrides={"device_processor": device_override},
-                        postprocessor_overrides={"device_processor": device_override},
-                    )
-                    self.logger.info(f"🔄 어댑터 '{adapter_name}'(으)로 물리량 통계치 업데이트 완료")
-                else:
-                    self.logger.warning(f"⚠️ 어댑터 경로 없음: {adapter_path}. 기본 통계치를 유지합니다.")
-            
-            self.logger.info(f"✅ 어댑터 {target_adapter_idx}번 스위칭 완료 ({time.perf_counter()-start_switch:.4f}s)")
+                # Postprocessor 내부의 mean/std 값을 어댑터용으로 강제 교체
+                # 'unnormalize' 단계의 파라미터를 직접 건드립니다.
+                if hasattr(self.postprocessor, 'processors'):
+                    for p in self.postprocessor.processors:
+                        if hasattr(p, 'stats'):
+                            # pydantic/torch 구조에 맞춰 텐서 형태로 주입
+                            p.stats = {k: torch.tensor(v).to(self.device) for k, v in new_stats.items()}
+                            self.logger.info(f"🔥 [CRITICAL FIX] {adapter_name}의 통계치로 Postprocessor 강제 업데이트 성공!")
+            else:
+                self.logger.warning(f"⚠️ {stats_path}가 없습니다. 수치가 작게 나올 수 있습니다.")
 
-        self.current_instruction = instruction_text
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
