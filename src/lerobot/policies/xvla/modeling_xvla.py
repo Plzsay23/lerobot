@@ -487,7 +487,7 @@ class XVLAPolicy(PreTrainedPolicy):
             state_dict[shared_key] = state_dict[encoder_key]
             # or deepcopy
         # step 4: load into instance
-        instance.load_state_dict(state_dict, strict=True)
+        instance.load_state_dict(state_dict, strict=False)
         logging.info("Loaded XVLA checkpoint")
         # step 5: finalize
         # Reapply dtype after loading state dict
