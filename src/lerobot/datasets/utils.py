@@ -665,17 +665,11 @@ def hw_to_dataset_features(
         }
 
     for key, shape in cam_fts.items():
-        # 카메라 이름에 'depth'가 포함되어 있는지 확인합니다.
-        is_depth = "depth" in key.lower() [cite: 40]
-        
         features[f"{prefix}.images.{key}"] = {
             "dtype": "video" if use_video else "image",
             "shape": shape,
             "names": ["height", "width", "channels"],
-            "info": {
-                "video.is_depth_map": is_depth,  # 뎁스 채널이면 True가 설정됩니다.
-            } if use_video else None
-        } [cite: 13, 40]
+        }
 
     _validate_feature_names(features)
     return features
