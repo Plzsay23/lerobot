@@ -379,24 +379,22 @@ class RobotClient:
     def control_loop_action(self, verbose: bool = True) -> dict[str, Any]:
         try:
             with self.action_queue_lock:
-                if self.action_queue.empty():
-                    self.logger.warning("⚠️ 액션 큐가 비었습니다! 서버 응답을 기다리는 중...")
-                    return None
+                if self.action_queue.empty(): return None
                 timed_action = self.action_queue.get_nowait()
         
-            # [디버깅] 로봇에 전달되는 실제 값 확인
+            # 서버에서 받은 텐서를 로봇 딕셔너리로 변환
             action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
-            self.logger.info(f"🤖 [DEBUG-CLIENT] Target to Robot: {action_dict}")
+            
+            # 🤖 [최종 확인용 로그] 하드웨어로 넘어가는 실제 수치
+            self.logger.info(f"🤖 [HARDWARE-IN] {action_dict}")
         
             _performed_action = self.robot.send_action(action_dict)
-        
-            with self.latest_action_lock:
-                self.latest_action = timed_action.get_timestep()
-            
+            self.latest_action = timed_action.get_timestep()
             return _performed_action
+            
         except Exception as e:
-            self.logger.error(f"❌ 로봇 제어 중 오류 발생: {e}")
-        return None
+            self.logger.error(f"❌ 하드웨어 제어 오류: {e}")
+            return None
 
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
