@@ -342,25 +342,25 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """1. Prepare observation"""
         try:
             obs_raw = observation_t.get_observation()
-            observation = raw_observation_to_observation(obs_raw, self.lerobot_features, self.policy.config.image_features)
+            # 관측치를 모델 규격에 맞춰 변환
+            observation = raw_observation_to_observation(
+                obs_raw, self.lerobot_features, self.policy.config.image_features
+            )
             
             with torch.inference_mode():
+                # 1. 전처리 수행
                 observation = self.preprocessor(observation)
                 
-                # 🔍 [검증] XVLAPolicy 호환성 수사
-                # disable_adapters가 없으므로, 현재 활성화된 상태에서의 출력만 먼저 확인합니다.
+                # 2. 모델 추론 (Autocast로 타입 에러 방지)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     adp_out = self.policy.predict_action_chunk(observation)
                 
-                # 🔍 [RAW-SCALE] 어댑터가 적용된 모델의 날것의 출력값
+                # [수사] 모델 출력 스케일 확인
                 raw_max = adp_out.abs().max().item()
-                raw_mean = adp_out.mean().item()
-                self.logger.info(f"📊 [RAW-CHECK] Max: {raw_max:.8f} | Mean: {raw_mean:.8f}")
+                self.logger.info(f"📊 [RAW-CHECK] Max: {raw_max:.8f}")
 
-                # 최종 추론 결과물 처리
+                # 3. 후처리 (물리량 복원)
                 action_tensor = adp_out.to(dtype=torch.float32)
-                
-                # 후처리 (Unnormalization)
                 processed_actions = []
                 for i in range(action_tensor.shape[1]):
                     processed_action = self.postprocessor(action_tensor[:, i, :])
@@ -368,17 +368,25 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 
                 final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
                 
-                # 🔍 [FINAL-ACTION] 로봇에게 전송될 실제 물리 수치 (각도)
+                # [수사] 최종 물리 수치 로그
                 final_vals = final_chunk[0].tolist()
                 self.logger.info(f"🚨 [DEBUG-SERVER] Final Action (J1-J6): {[f'{x:.4f}' for x in final_vals[:6]]}")
 
-                # 수치가 1보다 작으면 150배 증폭 (임시방편)
-                # 만약 이 로그가 뜬다면 stats.json 로드 실패입니다.
+                # 4. 임시 증폭 (통계치 로드 실패 시 자동 적용)
                 if final_chunk.abs().max() < 1.0:
                     final_chunk = final_chunk * 150.0
                     self.logger.warning("⚠️ 물리 수치가 너무 작아 150배 강제 증폭을 적용했습니다.")
 
-                return self._time_action_chunk(observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep())
+                return self._time_action_chunk(
+                    observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep()
+                )
+
+        except Exception as e:
+            # 에러 발생 시 로그를 남기고 다시 던집니다.
+            self.logger.error(f"❌ _predict_action_chunk 추론 실패: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            raise e
 
     def stop(self):
         """Stop the server"""
