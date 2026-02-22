@@ -382,48 +382,60 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """Autocast를 사용하여 내부 타입 충돌을 원천 차단합니다."""
+        """Predict an action chunk based on an observation.
+
+        Pipeline:
+        1. Convert raw observation to LeRobot format
+        2. Apply preprocessor (tokenization, normalization, batching, device placement)
+        3. Run policy inference to get action chunk
+        4. Apply postprocessor (unnormalization, device movement)
+        5. Convert to TimedAction list
+        """
+        """1. Prepare observation"""
         try:
             obs_raw = observation_t.get_observation()
+            # 관측치를 모델 규격에 맞춰 변환
             observation = raw_observation_to_observation(
-                obs_raw, self.lerobot_features, self.policy_image_features,
+                obs_raw, self.lerobot_features, self.policy.config.image_features
             )
             
             with torch.inference_mode():
+                # 1. 전처리 수행
                 observation = self.preprocessor(observation)
                 
-                # 1. XVLA 추론 (Autocast로 정밀도 및 속도 확보)
-                with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
-                    action_tensor = self.policy.predict_action_chunk(observation)
+                # 2. 모델 추론 (Autocast로 타입 에러 방지)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    adp_out = self.policy.predict_action_chunk(observation)
                 
-                # 2. 후처리를 위한 Float32 복구 및 로깅
-                action_tensor = action_tensor.to(dtype=torch.float32)
-                self.logger.info(f"📊 [RAW-CHECK] Max: {action_tensor.abs().max().item():.4f}")
+                # [수사] 모델 출력 스케일 확인
+                raw_max = adp_out.abs().max().item()
+                self.logger.info(f"📊 [RAW-CHECK] Max: {raw_max:.8f}")
 
-                # 3. 관절 수에 맞춰 슬라이싱 및 후처리
-                actual_dim = 6
-                if self.lerobot_features and "action" in self.lerobot_features:
-                    actual_dim = len(self.lerobot_features["action"])
-                action_tensor = action_tensor[:, :, :actual_dim]
-
+                # 3. 후처리 (물리량 복원)
+                action_tensor = adp_out.to(dtype=torch.float32)
                 processed_actions = []
                 for i in range(action_tensor.shape[1]):
-                    processed_actions.append(self.postprocessor(action_tensor[:, i, :]))
+                    processed_action = self.postprocessor(action_tensor[:, i, :])
+                    processed_actions.append(processed_action)
                 
                 final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
-
-                # 4. [검증 완료된 안전 로직] 증폭 없이 안전 범위(±45도) 제한
+                
+                final_chunk = final_chunk * 1.0 
+                
+                # 로봇의 기계적 보호를 위해 각도를 안전 범위로 제한합니다.
                 final_chunk = torch.clamp(final_chunk, min=-45.0, max=45.0)
                 
-                # 5. 최종 물리 수치 출력 (모니터링용)
+                # [수사 로그] 최종 물리 수치 재확인
                 final_vals = final_chunk[0].tolist()
-                self.logger.info(f"🚨 [FINAL-ACTION] J1-J6: {[f'{x:.2f}' for x in final_vals[:6]]}")
+                self.logger.info(f"🚨 [FINAL-ACTION] 안전범위 제한 후: {[f'{x:.2f}' for x in final_vals[:6]]}")
 
                 return self._time_action_chunk(
                     observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep()
                 )
+
         except Exception as e:
-            self.logger.error(f"❌ 추론 실패: {e}")
+            # 에러 발생 시 로그를 남기고 다시 던집니다.
+            self.logger.error(f"❌ _predict_action_chunk 추론 실패: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
             raise e

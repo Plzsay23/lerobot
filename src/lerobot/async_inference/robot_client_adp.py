@@ -376,25 +376,29 @@ class RobotClient:
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
 
-    def control_loop_action(self, verbose: bool = True) -> dict[str, Any]:
-        try:
-            with self.action_queue_lock:
-                if self.action_queue.empty(): return None
-                timed_action = self.action_queue.get_nowait()
+    def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
+        """Reading and performing actions in local queue"""
+        """로봇 하드웨어로 명령이 전달되기 직전의 값을 가로챕니다."""
+        get_start = time.perf_counter()
+        with self.action_queue_lock:
+            if self.action_queue.empty(): return None
+            timed_action = self.action_queue.get_nowait()
+        get_end = time.perf_counter() - get_start
+
+        # [수사] 로봇 드라이버 주입 직전의 딕셔너리 값
+        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        self.logger.info(f"🤖 [DEBUG-CLIENT] Target to Robot: {action_dict}")
+
+        # 실제 하드웨어 전송
+        _performed_action = self.robot.send_action(action_dict)
         
-            # 서버에서 받은 텐서를 로봇 딕셔너리로 변환
-            action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
-            
-            # 🤖 [최종 확인용 로그] 하드웨어로 넘어가는 실제 수치
-            self.logger.info(f"🤖 [HARDWARE-IN] {action_dict}")
+        # [수사] 로봇의 현재 위치 피드백
+        self.logger.debug(f"📊 [DEBUG-CLIENT] Performed Pos: {_performed_action}")
         
-            _performed_action = self.robot.send_action(action_dict)
+        with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
-            return _performed_action
-            
-        except Exception as e:
-            self.logger.error(f"❌ 하드웨어 제어 오류: {e}")
-            return None
+
+        return _performed_action
 
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
