@@ -368,9 +368,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 
                 final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
                 
-                # [수사] 최종 물리 수치 로그
+                final_chunk = final_chunk * 1.0 
+                
+                # 로봇의 기계적 보호를 위해 각도를 안전 범위로 제한합니다.
+                final_chunk = torch.clamp(final_chunk, min=-45.0, max=45.0)
+                
+                # [수사 로그] 최종 물리 수치 재확인
                 final_vals = final_chunk[0].tolist()
-                self.logger.info(f"🚨 [DEBUG-SERVER] Final Action (J1-J6): {[f'{x:.4f}' for x in final_vals[:6]]}")
+                self.logger.info(f"🚨 [FINAL-ACTION] 안전범위 제한 후: {[f'{x:.2f}' for x in final_vals[:6]]}")
 
                 return self._time_action_chunk(
                     observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep()
