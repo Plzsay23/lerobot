@@ -372,11 +372,6 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 final_vals = final_chunk[0].tolist()
                 self.logger.info(f"🚨 [DEBUG-SERVER] Final Action (J1-J6): {[f'{x:.4f}' for x in final_vals[:6]]}")
 
-                # 4. 임시 증폭 (통계치 로드 실패 시 자동 적용)
-                if final_chunk.abs().max() < 1.0:
-                    final_chunk = final_chunk * 150.0
-                    self.logger.warning("⚠️ 물리 수치가 너무 작아 150배 강제 증폭을 적용했습니다.")
-
                 return self._time_action_chunk(
                     observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep()
                 )
