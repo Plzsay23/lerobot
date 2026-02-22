@@ -119,20 +119,27 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """클라이언트의 VLM 명령어(번호+텍스트)를 해석하고 어댑터를 전환합니다"""
         if not self.running: return services_pb2.Empty()
         
+        # 1. 모델 상주 여부 최우선 확인
+        if self.policy is None:
+            self.logger.error("❌ 서버에 모델이 로드되지 않았습니다. _initialize_base_model 로그를 확인하세요.")
+            return services_pb2.Empty()
+
         policy_specs = pickle.loads(request.data)
         instr = str(policy_specs.pretrained_name_or_path).strip()
-        
-        # 1. 로봇 특징에 따른 프로세서 재구성 (Debug 파일의 핵심 성공 요인)
+
+        # 2. 로봇 특징에 따른 프로세서 재구성
         if policy_specs.lerobot_features:
             self.lerobot_features = policy_specs.lerobot_features
             device_override = {"device": self.device}
+            
+            # self.policy가 확실히 존재하므로 config 접근이 안전합니다
             self.preprocessor, self.postprocessor = make_pre_post_processors(
                 self.policy.config,
-                pretrained_path=self.config.pretrained_name_or_path, # 베이스 모델 경로
+                pretrained_path=os.getenv("BASE_MODEL", "lerobot/xvla-base"),
                 preprocessor_overrides={"device_processor": device_override},
                 postprocessor_overrides={"device_processor": device_override},
             )
-            self.logger.info(f"✅ 로봇 관절 특징에 맞춰 프로세서 재설정 완료")
+            self.logger.info(f"✅ 프로세서 재설정 완료: {list(self.lerobot_features.keys())}")
 
         # 2. VLM 명령어 해석 (예: '1 pick up' -> 어댑터 1번, 태스크 'pick up')
         target_adapter_idx = None
