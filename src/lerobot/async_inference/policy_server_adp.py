@@ -160,56 +160,60 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return services_pb2.Empty()
 
-    def SendPolicyInstructions(self, request, context):
-        """클라이언트 명령 수신 및 로봇 특징에 따른 프로세서 재구성"""
-        if not self.running: return services_pb2.Empty()
-        policy_specs = pickle.loads(request.data)
-        instr = str(policy_specs.pretrained_name_or_path).strip()
+    def SendPolicyInstructions(self, request, context):  # noqa: N802
+        """Receive policy instructions from the robot client"""
 
-        # [핵심 수정] 로봇 특징(관절 정보) 강제 업데이트 및 프로세서 재설정
-        if policy_specs.lerobot_features:
-            self.lerobot_features = policy_specs.lerobot_features
-            device_override = {"device": self.device}
-            # 클라이언트 하드웨어 정보에 맞춰 전/후처리기를 다시 생성합니다.
-            self.preprocessor, self.postprocessor = make_pre_post_processors(
-                self.policy.config,
-                pretrained_path=os.getenv("BASE_MODEL", "lerobot/xvla-base"),
-                preprocessor_overrides={"device_processor": device_override},
-                postprocessor_overrides={"device_processor": device_override},
+        if not self.running:
+            self.logger.warning("Server is not running. Ignoring policy instructions.")
+            return services_pb2.Empty()
+
+        client_id = context.peer()
+
+        policy_specs = pickle.loads(request.data)  # nosec
+
+        if not isinstance(policy_specs, RemotePolicyConfig):
+            raise TypeError(f"Policy specs must be a RemotePolicyConfig. Got {type(policy_specs)}")
+
+        if policy_specs.policy_type not in SUPPORTED_POLICIES:
+            raise ValueError(
+                f"Policy type {policy_specs.policy_type} not supported. "
+                f"Supported policies: {SUPPORTED_POLICIES}"
             )
-            self.logger.info(f"✅ 로봇 관절 특징 로드 및 프로세서 재설정 완료: {list(self.lerobot_features.keys())}")
-        
-        target_adapter_idx = None
-        if " " in instr:
-            parts = instr.split(" ", 1)
-            if parts[0].isdigit(): target_adapter_idx = int(parts[0])
-        elif instr.isdigit(): target_adapter_idx = int(instr)
 
-        if target_adapter_idx is not None:
-            # 1. 어댑터 가중치 스위칭
-            self.adapter_manager.switch(target_adapter_idx)
-            
-            # 2. 어댑터별 stats.json 주입
-            env_key = f"ADP{target_adapter_idx}"
-            adapter_name = os.getenv(env_key)
+        self.logger.info(
+            f"Receiving policy instructions from {client_id} | "
+            f"Policy type: {policy_specs.policy_type} | "
+            f"Pretrained name or path: {policy_specs.pretrained_name_or_path} | "
+            f"Actions per chunk: {policy_specs.actions_per_chunk} | "
+            f"Device: {policy_specs.device}"
+        )
 
-            if not adapter_name:
-                self.logger.error(f"❌ 환경 변수 {env_key} 설정 누락")
-                return services_pb2.Empty()
+        self.device = policy_specs.device
+        self.policy_type = policy_specs.policy_type  # act, pi0, etc.
+        self.lerobot_features = policy_specs.lerobot_features
+        self.actions_per_chunk = policy_specs.actions_per_chunk
 
-            stats_path = f"./adapter/{adapter_name}/stats.json" 
-            if os.path.exists(stats_path):
-                import json
-                with open(stats_path, "r") as f:
-                    new_stats = json.load(f)
+        policy_class = get_policy_class(self.policy_type)
 
-                if self.postprocessor and hasattr(self.postprocessor, 'processors'):
-                    for p in self.postprocessor.processors:
-                        if hasattr(p, 'stats'):
-                            p.stats = {k: torch.tensor(v).to(self.device) for k, v in new_stats.items()}
-                            self.logger.info(f"🔥 [SUCCESS] '{adapter_name}' 전용 통계치 주입 완료")
-            else:
-                self.logger.warning(f"⚠️ {stats_path} 누락으로 기본 통계치를 사용합니다.")
+        start = time.perf_counter()
+        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        self.policy.to(self.device)
+
+        # Load preprocessor and postprocessor, overriding device to match requested device
+        device_override = {"device": self.device}
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            self.policy.config,
+            pretrained_path=policy_specs.pretrained_name_or_path,
+            preprocessor_overrides={
+                "device_processor": device_override,
+                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
+            },
+            postprocessor_overrides={"device_processor": device_override},
+        )
+
+        end = time.perf_counter()
+
+        self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
 
         return services_pb2.Empty()
 
@@ -381,7 +385,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """추론 수행 및 물리 수치 검증/보정"""
+        """Predict an action chunk based on an observation.
+
+        Pipeline:
+        1. Convert raw observation to LeRobot format
+        2. Apply preprocessor (tokenization, normalization, batching, device placement)
+        3. Run policy inference to get action chunk
+        4. Apply postprocessor (unnormalization, device movement)
+        5. Convert to TimedAction list
+        """
+        """1. Prepare observation"""
         try:
             obs_raw = observation_t.get_observation()
             # 관측치를 모델 규격에 맞춰 변환
@@ -393,13 +406,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 # 1. 전처리 수행
                 observation = self.preprocessor(observation)
                 
-                # 2. 모델 추론 (Autocast 적용)
+                # 2. 모델 추론 (Autocast로 타입 에러 방지)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     adp_out = self.policy.predict_action_chunk(observation)
                 
-                # [모니터링 1] 모델 원본 출력 스케일 확인
+                # [수사] 모델 출력 스케일 확인
                 raw_max = adp_out.abs().max().item()
-                self.logger.info(f"🔍 [MONITOR-RAW] Max: {raw_max:.8f}")
+                self.logger.info(f"📊 [RAW-CHECK] Max: {raw_max:.8f}")
 
                 # 3. 후처리 (물리량 복원)
                 action_tensor = adp_out.to(dtype=torch.float32)
@@ -410,27 +423,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 
                 final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
                 
-                # [모니터링 2] 최종 물리 수치 (보정 전)
-                self.logger.info(f"📊 [MONITOR-PHYSICAL] J1-J6 (Pre-boost): {[f'{x:.2f}' for x in final_chunk[0].tolist()[:6]]}")
-
-                # 4. [보정 로직] debug 파일에서 검증된 증폭 및 안전장치
-                # 수치가 소수점 단위일 경우에만 150배 증폭을 수행합니다.
-                if final_chunk.abs().max() < 1.0:
-                    final_chunk = final_chunk * 150.0
-                    self.logger.warning("⚡ [MONITOR-BOOST] 150배 증폭 적용")
+                final_chunk = final_chunk * 1.0 
                 
-                # 하드웨어 보호를 위해 각도를 ±45도로 강제 제한합니다.
+                # 로봇의 기계적 보호를 위해 각도를 안전 범위로 제한합니다.
                 final_chunk = torch.clamp(final_chunk, min=-45.0, max=45.0)
                 
-                # [모니터링 3] 로봇에 전송될 최종 수치
+                # [수사 로그] 최종 물리 수치 재확인
                 final_vals = final_chunk[0].tolist()
-                self.logger.info(f"🚨 [FINAL-ACTION] J1-J6: {[f'{x:.2f}' for x in final_vals[:6]]}")
+                self.logger.info(f"🚨 [FINAL-ACTION] 안전범위 제한 후: {[f'{x:.2f}' for x in final_vals[:6]]}")
 
                 return self._time_action_chunk(
                     observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep()
                 )
 
         except Exception as e:
+            # 에러 발생 시 로그를 남기고 다시 던집니다.
             self.logger.error(f"❌ _predict_action_chunk 추론 실패: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
