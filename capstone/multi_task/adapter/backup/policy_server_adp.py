@@ -62,6 +62,10 @@ from .helpers import (
     raw_observation_to_observation,
 )
 
+# 멀티 어댑터 추가
+from .multi_adapter_manager import MultiAdapterManager
+import os
+
 
 class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
     prefix = "policy_server"
@@ -71,24 +75,65 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.config = config
         self.shutdown_event = threading.Event()
 
-        # FPS measurement
+        # FPS 및 큐 설정
         self.fps_tracker = FPSTracker(target_fps=config.fps)
-
         self.observation_queue = Queue(maxsize=1)
-
         self._predicted_timesteps_lock = threading.Lock()
         self._predicted_timesteps = set()
-
         self.last_processed_obs = None
 
-        # Attributes will be set by SendPolicyInstructions
-        self.device = None
-        self.policy_type = None
+        # 모델 및 프로세서 속성
+        self.device = config.device if hasattr(config, "device") else "cuda"
+        self.policy_type = "xvla" # XVLA 정책 고정
         self.lerobot_features = None
         self.actions_per_chunk = None
         self.policy = None
-        self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
-        self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
+        self.preprocessor = None
+        self.postprocessor = None
+
+        # [수정] 멀티 어댑터 매니저 초기화 (이때 어댑터들이 VRAM에 상주됨)
+        self.adapter_manager = MultiAdapterManager(self.logger)
+
+        # [수정] 서버 시작 시 베이스 모델을 VRAM에 즉시 상주
+        self._initialize_base_model()
+
+    def _initialize_base_model(self):
+        base_model_path = os.getenv("BASE_MODEL", "lerobot/xvla-base")
+        self.logger.info(f"🚀 [VRAM INIT] {base_model_path}")
+        
+        try:
+            policy_class = get_policy_class(self.policy_type)
+            # 1. 모델 로드 시도
+            self.policy = policy_class.from_pretrained(base_model_path)
+            
+            # 2. [강제 전환] 모델 전체를 bfloat16으로 즉시 변경
+            self.policy.to(device=self.device, dtype=torch.bfloat16)
+            
+            # 3. Steps 강제 고정
+            self.policy.config.num_denoising_steps = 3
+            self.policy.eval()
+
+            # [디버깅 로그 재확인]
+            param_dtype = next(self.policy.parameters()).dtype
+            vram_usage = torch.cuda.memory_allocated(self.device) / 1024**2
+            self.logger.info(f"🔍 [FIXED CHECK] Dtype: {param_dtype} | VRAM: {vram_usage:.2f}MB")
+            
+            # 전/후처리기 초기화
+            device_override = {"device": self.device}
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                self.policy.config,
+                pretrained_path=base_model_path,
+                preprocessor_overrides={"device_processor": device_override},
+                postprocessor_overrides={"device_processor": device_override},
+            )
+            
+            self.adapter_manager.set_policy(self.policy)
+            self.logger.info("✅ 베이스 모델 상주 완료.")
+            
+        except Exception as e:
+            self.logger.error(f"❌ 초기화 실패: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
 
     @property
     def running(self):
@@ -116,53 +161,56 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def SendPolicyInstructions(self, request, context):
-        """클라이언트의 VLM 명령어(번호+텍스트)를 해석하고 어댑터를 전환합니다"""
+        """클라이언트 명령 수신 및 로봇 특징에 따른 프로세서 재구성"""
         if not self.running: return services_pb2.Empty()
-        
         policy_specs = pickle.loads(request.data)
         instr = str(policy_specs.pretrained_name_or_path).strip()
-        
-        # 1. 로봇 특징에 따른 프로세서 재구성 (Debug 파일의 핵심 성공 요인)
+
+        # [핵심 수정] 로봇 특징(관절 정보) 강제 업데이트 및 프로세서 재설정
         if policy_specs.lerobot_features:
             self.lerobot_features = policy_specs.lerobot_features
             device_override = {"device": self.device}
+            # 클라이언트 하드웨어 정보에 맞춰 전/후처리기를 다시 생성하여 데이터 규격을 일치시킵니다.
             self.preprocessor, self.postprocessor = make_pre_post_processors(
                 self.policy.config,
-                pretrained_path=self.config.pretrained_name_or_path, # 베이스 모델 경로
+                pretrained_path=os.getenv("BASE_MODEL", "lerobot/xvla-base"),
                 preprocessor_overrides={"device_processor": device_override},
                 postprocessor_overrides={"device_processor": device_override},
             )
-            self.logger.info(f"✅ 로봇 관절 특징에 맞춰 프로세서 재설정 완료")
-
-        # 2. VLM 명령어 해석 (예: '1 pick up' -> 어댑터 1번, 태스크 'pick up')
+            self.logger.info(f"✅ 로봇 관절 특징 로드 및 프로세서 재설정 완료: {list(self.lerobot_features.keys())}")
+        
         target_adapter_idx = None
-        instruction_text = instr
         if " " in instr:
             parts = instr.split(" ", 1)
-            if parts[0].isdigit():
-                target_adapter_idx = int(parts[0])
-                instruction_text = parts[1]
-        
-        # 3. 어댑터 스위칭 및 전용 통계치(stats.json) 주입
+            if parts[0].isdigit(): target_adapter_idx = int(parts[0])
+        elif instr.isdigit(): target_adapter_idx = int(instr)
+
         if target_adapter_idx is not None:
+            # 1. 어댑터 가중치 스위칭
             self.adapter_manager.switch(target_adapter_idx)
             
+            # 2. 어댑터별 stats.json 주입
             env_key = f"ADP{target_adapter_idx}"
             adapter_name = os.getenv(env_key)
-            if adapter_name:
-                stats_path = f"./adapter/{adapter_name}/stats.json"
-                if os.path.exists(stats_path):
-                    import json
-                    with open(stats_path, "r") as f:
-                        new_stats = json.load(f)
-                    # 후처리기에 어댑터 전용 물리 수치 강제 주입
-                    if self.postprocessor and hasattr(self.postprocessor, 'processors'):
-                        for p in self.postprocessor.processors:
-                            if hasattr(p, 'stats'):
-                                p.stats = {k: torch.tensor(v).to(self.device) for k, v in new_stats.items()}
-                                self.logger.info(f"🔥 [VLM-READY] {adapter_name} 통계치 주입 완료")
 
-        self.current_instruction = instruction_text
+            if not adapter_name:
+                self.logger.error(f"❌ 환경 변수 {env_key} 설정 누락")
+                return services_pb2.Empty()
+
+            stats_path = f"./adapter/{adapter_name}/stats.json" 
+            if os.path.exists(stats_path):
+                import json
+                with open(stats_path, "r") as f:
+                    new_stats = json.load(f)
+
+                if self.postprocessor and hasattr(self.postprocessor, 'processors'):
+                    for p in self.postprocessor.processors:
+                        if hasattr(p, 'stats'):
+                            p.stats = {k: torch.tensor(v).to(self.device) for k, v in new_stats.items()}
+                            self.logger.info(f"🔥 [SUCCESS] '{adapter_name}' 전용 통계치 주입 완료")
+            else:
+                self.logger.warning(f"⚠️ {stats_path} 누락으로 기본 통계치를 사용합니다.")
+
         return services_pb2.Empty()
 
     def SendObservations(self, request_iterator, context):  # noqa: N802
@@ -207,31 +255,42 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         return services_pb2.Empty()
 
     def GetActions(self, request, context):  # noqa: N802
-        """Returns actions to the robot client. Actions are sent as a single
-        chunk, containing multiple actions."""
+        """클라이언트에게 액션 청크를 반환합니다. Dtype 충돌을 정밀 수사합니다."""
         client_id = context.peer()
         self.logger.debug(f"Client {client_id} connected for action streaming")
 
-        # Generate action based on the most recent observation and its timestep
         try:
             getactions_starts = time.perf_counter()
             obs = self.observation_queue.get(timeout=self.config.obs_queue_timeout)
-            self.logger.info(
-                f"Running inference for observation #{obs.get_timestep()} (must_go: {obs.must_go})"
-            )
-
+            
             with self._predicted_timesteps_lock:
                 self._predicted_timesteps.add(obs.get_timestep())
 
+            # 1. 추론 수행 (내부에서 BFloat16 -> Float32 변환 수행됨)
             start_time = time.perf_counter()
             action_chunk = self._predict_action_chunk(obs)
             inference_time = time.perf_counter() - start_time
 
+            # 2. [범인 검거] 직렬화 직전 리스트 내 텐서 타입 전수 조사
+            if action_chunk and len(action_chunk) > 0:
+                # 첫 번째 액션의 실제 데이터 확인
+                sample_act = action_chunk[0].action # TimedAction.action 접근
+                
+                if torch.is_tensor(sample_act):
+                    self.logger.info(f"🚨 [DTYPE CHECK] 최종 송신 텐서 타입: {sample_act.dtype}")
+                    
+                    # 만약 여전히 bfloat16이면 여기서 강제로 float32로 교정 (최후의 보루)
+                    if sample_act.dtype == torch.bfloat16:
+                        self.logger.warning("⚠️ BFloat16 발견! 피클 직렬화 전 Float32로 강제 변환합니다.")
+                        for ta in action_chunk:
+                            if torch.is_tensor(ta.action):
+                                ta.action = ta.action.to(torch.float32)
+
+            # 3. 직렬화 및 전송
             start_time = time.perf_counter()
-            actions_bytes = pickle.dumps(action_chunk)  # nosec
+            actions_bytes = pickle.dumps(action_chunk)
             serialize_time = time.perf_counter() - start_time
 
-            # Create and return the action chunk
             actions = services_pb2.Actions(data=actions_bytes)
 
             self.logger.info(
@@ -239,25 +298,21 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"Total time: {(inference_time + serialize_time) * 1000:.2f}ms"
             )
 
-            self.logger.debug(
-                f"Action chunk #{obs.get_timestep()} generated | "
-                f"Inference time: {inference_time:.2f}s |"
-                f"Serialize time: {serialize_time:.2f}s |"
-                f"Total time: {inference_time + serialize_time:.2f}s"
-            )
-
+            # 지연 시간 조절
             time.sleep(
                 max(0, self.config.inference_latency - max(0, time.perf_counter() - getactions_starts))
-            )  # sleep controls inference latency
+            )
 
             return actions
 
-        except Empty:  # no observation added to queue in obs_queue_timeout
+        except Empty:
             return services_pb2.Empty()
 
         except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
-
+            # 에러 발생 시 상세 정보 출력
+            self.logger.error(f"💥 GetActions 에러 발생: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return services_pb2.Empty()
 
     def _obs_sanity_checks(self, obs: TimedObservation, previous_obs: TimedObservation) -> bool:
@@ -315,46 +370,53 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         ]
 
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Get an action chunk from the policy. The chunk contains only"""
+        """추론 속도 최적화를 위해 denoising steps를 확인합니다."""
+        # XVLA의 경우 num_denoising_steps가 성능의 predi핵심입니다.
+        # 필요하다면 여기서 강제로 단계를 낮추어 테스트하십시오.
+        # self.policy.config.num_denoising_steps = 3 
+        
         chunk = self.policy.predict_action_chunk(observation)
         if chunk.ndim != 3:
-            chunk = chunk.unsqueeze(0)  # adding batch dimension, now shape is (B, chunk_size, action_dim)
-
+            chunk = chunk.unsqueeze(0)
         return chunk[:, : self.actions_per_chunk, :]
 
     def _predict_action_chunk(self, observation_t: TimedObservation) -> list[TimedAction]:
-        """VLM 명령이 반영된 추론을 수행하고 결과를 모니터링합니다"""
+        """추론 수행 및 물리 수치 검증/보정"""
         try:
             obs_raw = observation_t.get_observation()
-            # 텍스트 명령(VLM)이 포함된 관측치 생성
+            # 관측치를 모델 규격에 맞춰 변환
             observation = raw_observation_to_observation(
                 obs_raw, self.lerobot_features, self.policy.config.image_features
             )
             
             with torch.inference_mode():
+                # 1. 전처리 수행 (재설정된 preprocessor 사용)
                 observation = self.preprocessor(observation)
                 
-                # XVLA 추론 수행
+                # 2. 모델 추론 (Autocast 적용)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     adp_out = self.policy.predict_action_chunk(observation)
                 
-                # 모델 출력 상태 감시
+                # [모니터링 1] 모델 원본 출력 스케일 확인
                 raw_max = adp_out.abs().max().item()
-                self.logger.info(f"🔍 [MONITOR] Raw Max: {raw_max:.4f}")
+                self.logger.info(f"🔍 [MONITOR-RAW] Max: {raw_max:.8f}")
 
-                # 후처리 및 각도 복원
+                # 3. 후처리 (물리량 복원)
                 action_tensor = adp_out.to(dtype=torch.float32)
-                processed = [self.postprocessor(action_tensor[:, i, :]) for i in range(action_tensor.shape[1])]
-                final_chunk = torch.stack(processed, dim=1).squeeze(0).detach().cpu()
+                processed_actions = []
+                for i in range(action_tensor.shape[1]):
+                    processed_action = self.postprocessor(action_tensor[:, i, :])
+                    processed_actions.append(processed_action)
                 
-                # [성공 로직] 수치가 작을 경우 150배 증폭 및 ±45도 클램핑
-                if final_chunk.abs().max() < 1.0:
-                    final_chunk = final_chunk * 150.0
-                    self.logger.warning("⚡ [BOOST] 150배 증폭 적용 (소수점 출력 감지)")
+                final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
                 
+                # [모니터링 2] 최종 물리 수치 (보정 전)
+                self.logger.info(f"📊 [MONITOR-PHYSICAL] J1-J6 (Pre-boost): {[f'{x:.2f}' for x in final_chunk[0].tolist()[:6]]}")
+                
+                # 하드웨어 보호를 위해 각도를 ±45도로 강제 제한합니다.
                 final_chunk = torch.clamp(final_chunk, min=-45.0, max=45.0)
                 
-                # 로봇 전송 직전 최종 수치 로깅
+                # [모니터링 3] 로봇에 전송될 최종 수치
                 final_vals = final_chunk[0].tolist()
                 self.logger.info(f"🚨 [FINAL-ACTION] J1-J6: {[f'{x:.2f}' for x in final_vals[:6]]}")
 
@@ -363,7 +425,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 )
 
         except Exception as e:
-            self.logger.error(f"❌ 추론 실패: {e}")
+            self.logger.error(f"❌ _predict_action_chunk 추론 실패: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             raise e
 
     def stop(self):
