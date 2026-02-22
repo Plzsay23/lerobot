@@ -347,25 +347,20 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             with torch.inference_mode():
                 observation = self.preprocessor(observation)
                 
-                # 🔍 [검증 1] 어댑터 물리적 결합 수사
-                self.policy.disable_adapters()
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    base_out = self.policy.predict_action_chunk(observation)
-                
-                self.policy.enable_adapters()
+                # 🔍 [검증] XVLAPolicy 호환성 수사
+                # disable_adapters가 없으므로, 현재 활성화된 상태에서의 출력만 먼저 확인합니다.
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     adp_out = self.policy.predict_action_chunk(observation)
                 
-                # 어댑터가 베이스 모델을 얼마나 흔들고 있는지 측정
-                combine_diff = (adp_out - base_out).abs().max().item()
-                self.logger.info(f"🔄 [COMBINE-CHECK] 어댑터 영향력(Diff): {combine_diff:.8f}")
-
-                # 🔍 [검증 2] 원본 출력 스케일 확인
+                # 🔍 [RAW-SCALE] 어댑터가 적용된 모델의 날것의 출력값
                 raw_max = adp_out.abs().max().item()
-                self.logger.info(f"📊 [RAW-SCALE] 모델 원본 Max: {raw_max:.4f}")
+                raw_mean = adp_out.mean().item()
+                self.logger.info(f"📊 [RAW-CHECK] Max: {raw_max:.8f} | Mean: {raw_mean:.8f}")
 
+                # 최종 추론 결과물 처리
                 action_tensor = adp_out.to(dtype=torch.float32)
                 
+                # 후처리 (Unnormalization)
                 processed_actions = []
                 for i in range(action_tensor.shape[1]):
                     processed_action = self.postprocessor(action_tensor[:, i, :])
@@ -373,19 +368,17 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 
                 final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
                 
-                # 🔍 [검증 3] 최종 물리 수치(각도) 로그
+                # 🔍 [FINAL-ACTION] 로봇에게 전송될 실제 물리 수치 (각도)
                 final_vals = final_chunk[0].tolist()
-                self.logger.info(f"🚨 [FINAL-ACTION] J1: {final_vals[0]:.2f} | J2: {final_vals[1]:.2f} | J3: {final_vals[2]:.2f} | G: {final_vals[5]:.2f}")
+                self.logger.info(f"🚨 [DEBUG-SERVER] Final Action (J1-J6): {[f'{x:.4f}' for x in final_vals[:6]]}")
 
-                # 임시 증폭 (통계치 로드 실패 시 150배)
-                if combine_diff > 0 and final_chunk.abs().max() < 1.0:
+                # 수치가 1보다 작으면 150배 증폭 (임시방편)
+                # 만약 이 로그가 뜬다면 stats.json 로드 실패입니다.
+                if final_chunk.abs().max() < 1.0:
                     final_chunk = final_chunk * 150.0
                     self.logger.warning("⚠️ 물리 수치가 너무 작아 150배 강제 증폭을 적용했습니다.")
 
                 return self._time_action_chunk(observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep())
-        except Exception as e:
-            self.logger.error(f"❌ 추론 실패: {e}")
-            raise e
 
     def stop(self):
         """Stop the server"""
