@@ -369,41 +369,25 @@ class RobotClient:
 
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
         """Reading and performing actions in local queue"""
-
-        # Lock only for queue operations
+        """로봇 하드웨어로 명령이 전달되기 직전의 값을 가로챕니다."""
         get_start = time.perf_counter()
         with self.action_queue_lock:
-            self.action_queue_size.append(self.action_queue.qsize())
-            # Get action from queue
+            if self.action_queue.empty(): return None
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
+        # [수사] 로봇 드라이버 주입 직전의 딕셔너리 값
         action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
-
         self.logger.info(f"🤖 [DEBUG-CLIENT] Target to Robot: {action_dict}")
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
-
+        # 실제 하드웨어 전송
+        _performed_action = self.robot.send_action(action_dict)
+        
+        # [수사] 로봇의 현재 위치 피드백
         self.logger.debug(f"📊 [DEBUG-CLIENT] Performed Pos: {_performed_action}")
         
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
-
-        if verbose:
-            with self.action_queue_lock:
-                current_queue_size = self.action_queue.qsize()
-
-            self.logger.debug(
-                f"Ts={timed_action.get_timestamp()} | "
-                f"Action #{timed_action.get_timestep()} performed | "
-                f"Queue size: {current_queue_size}"
-            )
-
-            self.logger.debug(
-                f"Popping action from queue to perform took {get_end:.6f}s | Queue size: {current_queue_size}"
-            )
 
         return _performed_action
 

@@ -340,74 +340,52 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         5. Convert to TimedAction list
         """
         """1. Prepare observation"""
-        start_prepare = time.perf_counter()
-        observation: Observation = raw_observation_to_observation(
-            observation_t.get_observation(),
-            self.lerobot_features,
-            self.policy_image_features,
-        )
-        prepare_time = time.perf_counter() - start_prepare
+        try:
+            obs_raw = observation_t.get_observation()
+            observation = raw_observation_to_observation(obs_raw, self.lerobot_features, self.policy.config.image_features)
+            
+            with torch.inference_mode():
+                observation = self.preprocessor(observation)
+                
+                # 🔍 [검증 1] 어댑터 물리적 결합 수사
+                self.policy.disable_adapters()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    base_out = self.policy.predict_action_chunk(observation)
+                
+                self.policy.enable_adapters()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    adp_out = self.policy.predict_action_chunk(observation)
+                
+                # 어댑터가 베이스 모델을 얼마나 흔들고 있는지 측정
+                combine_diff = (adp_out - base_out).abs().max().item()
+                self.logger.info(f"🔄 [COMBINE-CHECK] 어댑터 영향력(Diff): {combine_diff:.8f}")
 
-        """2. Apply preprocessor"""
-        start_preprocess = time.perf_counter()
-        observation = self.preprocessor(observation)
-        self.last_processed_obs: TimedObservation = observation_t
-        preprocessing_time = time.perf_counter() - start_preprocess
+                # 🔍 [검증 2] 원본 출력 스케일 확인
+                raw_max = adp_out.abs().max().item()
+                self.logger.info(f"📊 [RAW-SCALE] 모델 원본 Max: {raw_max:.4f}")
 
-        """3. Get action chunk"""
-        start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
-        inference_time = time.perf_counter() - start_inference
-        raw_max = action_tensor.abs().max().item()
-        raw_mean = action_tensor.mean().item()
-        self.logger.info(f"🔍 [DEBUG-SERVER] Raw Output - Max: {raw_max:.4f}, Mean: {raw_mean:.4f}")
+                action_tensor = adp_out.to(dtype=torch.float32)
+                
+                processed_actions = []
+                for i in range(action_tensor.shape[1]):
+                    processed_action = self.postprocessor(action_tensor[:, i, :])
+                    processed_actions.append(processed_action)
+                
+                final_chunk = torch.stack(processed_actions, dim=1).squeeze(0).detach().cpu()
+                
+                # 🔍 [검증 3] 최종 물리 수치(각도) 로그
+                final_vals = final_chunk[0].tolist()
+                self.logger.info(f"🚨 [FINAL-ACTION] J1: {final_vals[0]:.2f} | J2: {final_vals[1]:.2f} | J3: {final_vals[2]:.2f} | G: {final_vals[5]:.2f}")
 
-        """4. Apply postprocessor"""
-        # Apply postprocessor (handles unnormalization and device movement)
-        # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
-        # So we process each action in the chunk individually
-        start_postprocess = time.perf_counter()
-        _, chunk_size, _ = action_tensor.shape
+                # 임시 증폭 (통계치 로드 실패 시 150배)
+                if combine_diff > 0 and final_chunk.abs().max() < 1.0:
+                    final_chunk = final_chunk * 150.0
+                    self.logger.warning("⚠️ 물리 수치가 너무 작아 150배 강제 증폭을 적용했습니다.")
 
-        # Process each action in the chunk
-        processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
-
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
-        self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
-
-        action_tensor = action_tensor.detach().cpu()
-
-        final_vals = action_tensor[0].tolist() # 첫 번째 프레임
-        self.logger.info(f"🚨 [DEBUG-SERVER] Final Action (J1-J6): {[f'{x:.4f}' for x in final_vals[:6]]}")
-
-        """5. Convert to TimedAction list"""
-        action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
-        )
-        postprocess_stops = time.perf_counter()
-        postprocessing_time = postprocess_stops - start_postprocess
-
-        self.logger.info(
-            f"Observation {observation_t.get_timestep()} | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
-        )
-
-        self.logger.debug(
-            f"Observation {observation_t.get_timestep()} | "
-            f"Prepare time: {1000 * prepare_time:.2f}ms | "
-            f"Preprocessing time: {1000 * preprocessing_time:.2f}ms | "
-            f"Inference time: {1000 * inference_time:.2f}ms | "
-            f"Postprocessing time: {1000 * postprocessing_time:.2f}ms | "
-            f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
-        )
-
-        return action_chunk
+                return self._time_action_chunk(observation_t.get_timestamp(), list(final_chunk), observation_t.get_timestep())
+        except Exception as e:
+            self.logger.error(f"❌ 추론 실패: {e}")
+            raise e
 
     def stop(self):
         """Stop the server"""
