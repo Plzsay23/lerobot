@@ -1,0 +1,7 @@
+pytest
+pytest-benchmark
+matplotlib
+av 
+pandas
+tabulate
+omegaconf
