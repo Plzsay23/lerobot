@@ -189,37 +189,41 @@ class RobotClient:
         self.channel.close()
         self.logger.debug("Client stopped, channel closed")
     def return_to_home(robot, logger=None):
-        """로봇을 안전한 초기 위치(Home Position)로 이동시킵니다."""
-        if logger:
-            logger.info("홈 포지션으로 복귀 중...")
-        else:
-            print("홈 포지션으로 복귀 중...")
-    
+        """현재 위치에서 설정된 기본 상태값(접힌 상태)으로 부드럽게 이동합니다."""
+        import time
+        log_func = logger.info if logger else print
+        
+        # 베이스(2053) -> 그리퍼(1778) 순서의 목표 각도값
+        TARGET_HOME = [2053, 771, 3152, 2821, 1870, 1778]
+        
         try:
-            # 1. 그리퍼를 먼저 엽니다 (물건을 들고 있었다면 떨어뜨림, 안전 확보)
-            # (SO-100 모델 기준: 그리퍼를 여는 값이 환경에 따라 다를 수 있습니다. 예: 1.0 또는 0.0)
-            gripper_open_action = {
-                "action": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0]  # 6번째 값이 그리퍼라고 가정
-            }
-            # robot.send_action(gripper_open_action)
-            # time.sleep(1.0)
+            # 1. 로봇의 현재 관절 각도를 읽어옵니다.
+            obs = robot.get_observation()
+            # SO-100 모델 환경에 맞게 키 값 확인
+            current_pos = obs.get("position", obs.get("state")) 
+            
+            if current_pos is None:
+                log_func(" 현재 위치를 읽을 수 없어 바로 이동합니다.")
+                robot.send_action({"action": TARGET_HOME})
+                return
     
-            # 2. 로봇 팔을 기본 대기 자세(모든 각도 0 또는 안전한 각도)로 이동
-            home_action = {
-                # 실제 로봇의 안전한 홈 각도를 측정해서 넣으세요. (예: 다 펴거나 살짝 굽힌 상태)
-                "action": [0.0, -10.0, 10.0, 0.0, 0.0, 1.0]
-            }
-    
-            # 부드럽게 이동하도록 여러 번 명령을 보내거나 라이브러리의 이동 함수 사용
-            robot.send_action(home_action)
-            time.sleep(1.5)  # 로봇이 홈 위치로 갈 때까지 대기
-    
-            if logger:
-                logger.info(" 홈 복귀 완료.")
-    
+            log_func(" 홈 포지션으로 부드럽게 복귀 중...")
+            
+            # 2. 현재 위치 -> 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동
+            steps = 30
+            for i in range(1, steps + 1):
+                interpolated_action = []
+                for curr, target in zip(current_pos, TARGET_HOME):
+                    step_val = curr + (target - curr) * (i / steps)
+                    interpolated_action.append(step_val)
+                
+                robot.send_action({"action": interpolated_action})
+                time.sleep(0.03) 
+                
+            log_func("✅ 홈 복귀 완료.")
+            
         except Exception as e:
-            if logger:
-                logger.error(f" 홈 복귀 중 에러 발생: {e}")
+            log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
 
     def send_observation(
         self,
@@ -564,20 +568,20 @@ def async_client(cfg: RobotClientConfig):
                 action_receiver_thread.start()
 
                 try:
-                    # 제어 루프 진입 (30초 타임아웃 설정)
+                    # 제어 루프 진입 (여기서 실제 로봇이 VLA 모델의 명령을 받아 움직임)
                     client.control_loop(task=user_input, max_duration=30)
                     
-                    #  [상황 1 & 2] 루프가 무사히 끝났거나, 타임아웃으로 끝남 (성공/실패 판단 후 복귀)
-                    print("\n 작업(또는 시간)이 종료되었습니다. 초기 위치로 복귀합니다.")
-                    return_to_home(shared_robot, client.logger)
+                    # 동작이 정상적으로 끝나거나 타임아웃 되면 자동으로 복귀
+                    print("\n🏁 제어 루프 종료. 초기 위치로 복귀합니다.")
+                    return_to_home(shared_robot, logger=client.logger)
 
                 except KeyboardInterrupt:
-                    #  [상황 3] 사람이 직접 중단함 (긴급 정지)
-                    print("\n 긴급 정지 감지! 로봇을 안전하게 초기 위치로 복귀시킵니다.")
-                    return_to_home(shared_robot, client.logger)
+                    # 사용자가 이상함을 감지하고 Ctrl+C를 눌렀을 때도 안전하게 복귀
+                    print("\n🛑 동작 중단(긴급 정지) 감지! 안전하게 초기 위치로 복귀시킵니다.")
+                    return_to_home(shared_robot, logger=client.logger)
                     
                 finally:
-                    # 통신 종료 (모델은 서버 램에 유지)
+                    # 통신만 종료하고 모델은 서버 램에 유지
                     client.shutdown_event.set()
                     client.channel.close()
                     if action_receiver_thread.is_alive():
