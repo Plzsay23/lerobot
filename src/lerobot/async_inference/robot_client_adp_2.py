@@ -44,44 +44,41 @@ map_robot_keys_to_lerobot_features,
 visualize_action_queue_size,
 )
 
-=========================================================================
-[추가됨] 로봇을 기본 상태(홈 포지션)로 부드럽게 복귀시키는 함수
-=========================================================================
+#[추가됨] 로봇을 기본 상태(홈 포지션)로 부드럽게 복귀시키는 함수
 def return_to_home(robot, logger=None):
-"""현재 위치에서 설정된 기본 상태값(접힌 상태)으로 부드럽게 이동합니다."""
-log_func = logger.info if logger else print
-
-# 베이스(2053) -> 그리퍼(1778) 순서의 목표 각도값
-TARGET_HOME = [2053, 771, 3152, 2821, 1870, 1778]
-
-try:
-    # 1. 로봇의 현재 관절 각도를 읽어옵니다.
-    obs = robot.get_observation()
-    # SO-100 모델 환경에 맞게 키 값 확인 (position 또는 state)
-    current_pos = obs.get("position", obs.get("state")) 
+    log_func = logger.info if logger else print
     
-    if current_pos is None:
-        log_func("⚠️ 현재 위치를 읽을 수 없어 바로 이동합니다.")
-        robot.send_action({"action": TARGET_HOME})
-        return
-
-    log_func("🏠 홈 포지션으로 부드럽게 복귀 중...")
+    # 베이스(2053) -> 그리퍼(1778) 순서의 목표 각도값
+    TARGET_HOME = [2053, 771, 3152, 2821, 1870, 1778]
     
-    # 2. 현재 위치 -> 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동 (약 1초 소요)
-    steps = 30
-    for i in range(1, steps + 1):
-        interpolated_action = []
-        for curr, target in zip(current_pos, TARGET_HOME):
-            step_val = curr + (target - curr) * (i / steps)
-            interpolated_action.append(step_val)
+    try:
+        # 1. 로봇의 현재 관절 각도를 읽어옵니다.
+        obs = robot.get_observation()
+        # SO-100 모델 환경에 맞게 키 값 확인 (position 또는 state)
+        current_pos = obs.get("position", obs.get("state")) 
         
-        robot.send_action({"action": interpolated_action})
-        time.sleep(0.03) 
-        
-    log_func("✅ 홈 복귀 완료.")
+        if current_pos is None:
+            log_func("⚠️ 현재 위치를 읽을 수 없어 바로 이동합니다.")
+            robot.send_action({"action": TARGET_HOME})
+            return
     
-except Exception as e:
-    log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
+        log_func("🏠 홈 포지션으로 부드럽게 복귀 중...")
+        
+        # 2. 현재 위치 -> 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동 (약 1초 소요)
+        steps = 30
+        for i in range(1, steps + 1):
+            interpolated_action = []
+            for curr, target in zip(current_pos, TARGET_HOME):
+                step_val = curr + (target - curr) * (i / steps)
+                interpolated_action.append(step_val)
+            
+            robot.send_action({"action": interpolated_action})
+            time.sleep(0.03) 
+            
+        log_func("✅ 홈 복귀 완료.")
+        
+    except Exception as e:
+        log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
 class RobotClient:
     prefix = "robot_client"
     logger = get_logger(prefix)
@@ -466,9 +463,7 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
     
-    # =========================================================================
     # [수정됨] max_duration (타임아웃) 파라미터 및 로직 추가
-    # =========================================================================
     def control_loop(self, task: str, max_duration: int = 30, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
         # Wait at barrier for synchronized start
@@ -550,9 +545,7 @@ class RobotClient:
                 action_receiver_thread.start()
     
                 try:
-                    # =========================================================================
                     # [수정됨] 30초 타임아웃 적용 및 성공 시 홈 복귀 호출
-                    # =========================================================================
                     # 로봇 실행 (Ctrl+C를 누를 때까지 여기서 멈춤)
                     client.control_loop(task=user_instruction, max_duration=30)
                     
@@ -560,9 +553,7 @@ class RobotClient:
                     return_to_home(shared_robot, logger=client.logger)
     
                 except KeyboardInterrupt:
-                    # =========================================================================
                     # [수정됨] 긴급 정지 시 홈 복귀 호출
-                    # =========================================================================
                     print("\n🛑 동작 정지! 대기 모드로 전환합니다.")
                     print("안전하게 초기 위치로 복귀시킵니다.")
                     return_to_home(shared_robot, logger=client.logger)
