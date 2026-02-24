@@ -564,12 +564,20 @@ def async_client(cfg: RobotClientConfig):
                 action_receiver_thread.start()
 
                 try:
-                    # 제어 루프 진입
-                    client.control_loop(task=user_input)
+                    # 제어 루프 진입 (30초 타임아웃 설정)
+                    client.control_loop(task=user_input, max_duration=30)
+                    
+                    #  [상황 1 & 2] 루프가 무사히 끝났거나, 타임아웃으로 끝남 (성공/실패 판단 후 복귀)
+                    print("\n 작업(또는 시간)이 종료되었습니다. 초기 위치로 복귀합니다.")
+                    return_to_home(shared_robot, client.logger)
+
                 except KeyboardInterrupt:
-                    print("\n🛑 동작 중단. 다음 명령 대기...")
+                    #  [상황 3] 사람이 직접 중단함 (긴급 정지)
+                    print("\n 긴급 정지 감지! 로봇을 안전하게 초기 위치로 복귀시킵니다.")
+                    return_to_home(shared_robot, client.logger)
+                    
                 finally:
-                    # 통신만 종료하고 모델은 서버 램에 유지
+                    # 통신 종료 (모델은 서버 램에 유지)
                     client.shutdown_event.set()
                     client.channel.close()
                     if action_receiver_thread.is_alive():
