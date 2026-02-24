@@ -492,83 +492,84 @@ class RobotClient:
     
         return _captured_observation, _performed_action
     @draccus.wrap()
-    def async_client(cfg: RobotClientConfig):
-        logging.info(pformat(asdict(cfg)))
-        
-        if cfg.robot.type not in SUPPORTED_ROBOTS:
-            raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
-        
-        # 1. 로봇 하드웨어 초기화 (프로그램 켤 때 딱 한 번만 수행)
-        print("\n[System] Initializing Robot Hardware...")
-        from lerobot.robots import make_robot_from_config
-        
-        # 로봇 객체를 여기서 미리 생성하고 연결합니다.
-        shared_robot = make_robot_from_config(cfg.robot)
-        shared_robot.connect()
-        
-        print("\n" + "="*50)
-        print("Interactive Agent Ready!")
-        print("==================================================")
-        
-        # 2. 메인 루프 (입력 -> 실행 -> 중단 -> 반복)
-        while True:
-            try:
-                print("\n명령을 입력하세요 (종료하려면 'exit' 입력)")
-                user_instruction = input(">>> ")
-                
-                if user_instruction.lower() in ["exit", "quit"]:
-                    print("시스템을 종료합니다.")
-                    break
-                
-                if not user_instruction.strip():
-                    continue
-        
-                # 설정에 명령어 반영
-                cfg.task = user_instruction
-                
-                print(f"실행 중: '{user_instruction}'")
-                print("   (중단하고 다시 명령을 내리려면 'Ctrl + C'를 누르세요)")
-        
-                # 3. 클라이언트 생성 (미리 만든 shared_robot을 주입!)
-                client = RobotClient(cfg, robot=shared_robot)
-                
-                # 명령어 변수 확실하게 설정
-                client.set_instruction(user_instruction)
-        
-                if client.start():
-                    client.logger.info("Starting action receiver thread...")
-                    action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
-                    action_receiver_thread.start()
-        
-                    try:
-                        # [수정됨] 30초 타임아웃 적용 및 성공 시 홈 복귀 호출
-                        # 로봇 실행 (Ctrl+C를 누를 때까지 여기서 멈춤)
-                        client.control_loop(task=user_instruction, max_duration=30)
-                        
-                        print("\n🏁 제어 루프 종료. 초기 위치로 복귀합니다.")
-                        return_to_home(shared_robot, logger=client.logger)
-        
-                    except KeyboardInterrupt:
-                        # [수정됨] 긴급 정지 시 홈 복귀 호출
-                        print("\n🛑 동작 정지! 대기 모드로 전환합니다.")
-                        print("안전하게 초기 위치로 복귀시킵니다.")
-                        return_to_home(shared_robot, logger=client.logger)
-                        
-                    finally:
-                        # 이번 세션 종료 (로봇 연결은 끊지 않음)
-                        client.shutdown_event.set()
-                        client.channel.close() # 서버와의 통신만 닫음
-                        if action_receiver_thread.is_alive():
-                            action_receiver_thread.join(timeout=1.0)
-                            
-            except Exception as e:
-                print(f"오류 발생: {e}")
-                import traceback
-                traceback.print_exc()
+def async_client(cfg: RobotClientConfig):
+    logging.info(pformat(asdict(cfg)))
+    
+    if cfg.robot.type not in SUPPORTED_ROBOTS:
+        raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
+    
+    # 1. 로봇 하드웨어 초기화 (프로그램 켤 때 딱 한 번만 수행)
+    print("\n[System] Initializing Robot Hardware...")
+    from lerobot.robots import make_robot_from_config
+    
+    # 로봇 객체를 여기서 미리 생성하고 연결합니다.
+    shared_robot = make_robot_from_config(cfg.robot)
+    shared_robot.connect()
+    
+    print("\n" + "="*50)
+    print("Interactive Agent Ready!")
+    print("==================================================")
+    
+    # 2. 메인 루프 (입력 -> 실행 -> 중단 -> 반복)
+    while True:
+        try:
+            print("\n명령을 입력하세요 (종료하려면 'exit' 입력)")
+            user_instruction = input(">>> ")
+            
+            if user_instruction.lower() in ["exit", "quit"]:
+                print("시스템을 종료합니다.")
                 break
+            
+            if not user_instruction.strip():
+                continue
+    
+            # 설정에 명령어 반영
+            cfg.task = user_instruction
+            
+            print(f"실행 중: '{user_instruction}'")
+            print("   (중단하고 다시 명령을 내리려면 'Ctrl + C'를 누르세요)")
+    
+            # 3. 클라이언트 생성 (미리 만든 shared_robot을 주입!)
+            client = RobotClient(cfg, robot=shared_robot)
+            
+            # 명령어 변수 확실하게 설정
+            client.set_instruction(user_instruction)
+    
+            if client.start():
+                client.logger.info("Starting action receiver thread...")
+                action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+                action_receiver_thread.start()
+    
+                try:
+                    # [수정됨] 30초 타임아웃 적용 및 성공 시 홈 복귀 호출
+                    # 로봇 실행 (Ctrl+C를 누를 때까지 여기서 멈춤)
+                    client.control_loop(task=user_instruction, max_duration=30)
+                    
+                    print("\n🏁 제어 루프 종료. 초기 위치로 복귀합니다.")
+                    return_to_home(shared_robot, logger=client.logger)
+    
+                except KeyboardInterrupt:
+                    # [수정됨] 긴급 정지 시 홈 복귀 호출
+                    print("\n🛑 동작 정지! 대기 모드로 전환합니다.")
+                    print("안전하게 초기 위치로 복귀시킵니다.")
+                    return_to_home(shared_robot, logger=client.logger)
+                    
+                finally:
+                    # 이번 세션 종료 (로봇 연결은 끊지 않음)
+                    client.shutdown_event.set()
+                    client.channel.close() # 서버와의 통신만 닫음
+                    if action_receiver_thread.is_alive():
+                        action_receiver_thread.join(timeout=1.0)
+                        
+        except Exception as e:
+            print(f"오류 발생: {e}")
+            import traceback
+            traceback.print_exc()
+            break
+    
+    # 프로그램 종료 시 로봇 연결 해제
+    if 'shared_robot' in locals():
+        shared_robot.disconnect()
         
-        # 프로그램 종료 시 로봇 연결 해제
-        if 'shared_robot' in locals():
-            shared_robot.disconnect()
 if __name__ == "__main__":
     async_client()  # run the client
