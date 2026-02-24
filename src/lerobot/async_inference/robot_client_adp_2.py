@@ -190,7 +190,6 @@ class RobotClient:
         self.logger.debug("Client stopped, channel closed")
     def return_to_home(robot, logger=None):
         """현재 위치에서 설정된 기본 상태값(접힌 상태)으로 부드럽게 이동합니다."""
-        import time
         log_func = logger.info if logger else print
         
         # 베이스(2053) -> 그리퍼(1778) 순서의 목표 각도값
@@ -569,7 +568,7 @@ def async_client(cfg: RobotClientConfig):
 
                 try:
                     # 제어 루프 진입 (여기서 실제 로봇이 VLA 모델의 명령을 받아 움직임)
-                    client.control_loop(task=user_input, max_duration=30)
+                    client.control_loop(task=user_input, max_duration=20)
                     
                     # 동작이 정상적으로 끝나거나 타임아웃 되면 자동으로 복귀
                     print("\n🏁 제어 루프 종료. 초기 위치로 복귀합니다.")
