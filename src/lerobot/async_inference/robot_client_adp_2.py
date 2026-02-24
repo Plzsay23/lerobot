@@ -567,6 +567,8 @@ class RobotClient:
                 traceback.print_exc()
                 break
         
-# 프로그램 종료 시 로봇 연결 해제
-if 'shared_robot' in locals():
-    shared_robot.disconnect()
+        # 프로그램 종료 시 로봇 연결 해제
+        if 'shared_robot' in locals():
+            shared_robot.disconnect()
+if __name__ == "__main__":
+    async_client()  # run the client
