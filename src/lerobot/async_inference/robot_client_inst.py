@@ -80,68 +80,59 @@ from .helpers import (
 )
 
 def return_to_home(robot, logger=None):
-    """각 관절의 개별 위치를 정확히 읽어, 2단계로 부드럽게 복귀합니다."""
+    """인식된 모터 개수에 맞춰 자동으로 대응하는 스마트 복귀 함수"""
     import time
     log_func = logger.info if logger else print
     
-    # 🎯 최종 목적지 (접힌 상태)
-    TARGET_HOME = [2128, 872, 3184, 2708, 1870, 1540]
-    # 🛑 1단계 경유지 (로봇 팔을 꼬이지 않게 위로 살짝 드는 만세 자세)
-    SAFE_WAYPOINT = [2128, 2048, 2048, 2048, 1870, 1540]
+    # 1. 로봇이 현재 실제로 가지고 있는 모터 이름들을 싹 다 가져옵니다!
+    JOINT_KEYS = list(robot.action_features)
     
-    # LeRobot SO-100 모델의 개별 모터 키 이름 (순서가 매우 중요합니다!)
-    JOINT_KEYS = [
-        'shoulder_pan.pos', 
-        'shoulder_lift.pos', 
-        'elbow_flex.pos', 
-        'wrist_flex.pos', 
-        'wrist_roll.pos', 
-        'gripper.pos'
-    ]
+    # 🚨 [여기 수정 필요] 캘리브레이션 후 모터 개수에 맞춰서 숫자를 적어주세요!
+    # (예시: 손목 하나가 빠져서 모터가 5개가 되었다면, 숫자도 5개로 맞춰야 합니다)
+    TARGET_HOME = [2128, 872, 3184, 1870, 1540]  # <--- 본인의 홈 위치 값으로 수정!
+    SAFE_WAYPOINT = [2128, 2048, 2048, 1870, 1540] # <--- 충돌 안 나는 만세 자세 값으로 수정!
     
     try:
+        log_func(f"\n🤖 현재 연결된 진짜 모터 목록 ({len(JOINT_KEYS)}개): {JOINT_KEYS}")
+        
+        # 2. [안전장치] 모터 개수와 내가 적은 숫자 개수가 다르면 즉시 중지!
+        if len(JOINT_KEYS) != len(TARGET_HOME):
+            log_func(f"❌ [에러] 모터는 {len(JOINT_KEYS)}개인데, TARGET_HOME 숫자는 {len(TARGET_HOME)}개입니다!")
+            log_func("코드의 TARGET_HOME과 SAFE_WAYPOINT 리스트의 숫자 개수를 모터 개수와 똑같이 맞춰주세요.")
+            return
+            
         obs = robot.get_observation()
         
-        # 1. 개별 키에서 값을 하나씩 뽑아와서 현재 위치 리스트(current_pos) 만들기
         current_pos = []
         for key in JOINT_KEYS:
             if key in obs:
                 val = obs[key]
-                # 텐서(Tensor) 형태라면 숫자만 쏙 빼옵니다
-                if hasattr(val, "item"):
-                    val = val.item()
+                if hasattr(val, "item"): val = val.item()
                 current_pos.append(val)
             else:
-                log_func(f"❌ 앗! '{key}' 값을 찾을 수 없습니다! 복귀를 취소합니다.")
+                log_func(f"❌ 앗! '{key}' 값을 찾을 수 없습니다. 복귀를 취소합니다.")
                 return
                 
-        log_func(f"\n📊 현재 위치: [ {', '.join(f'{x:.1f}' for x in current_pos)} ]")
+        log_func(f"📊 현재 위치: [ {', '.join(f'{x:.1f}' for x in current_pos)} ]")
         log_func("🧗 1단계: 충돌을 피하기 위해 팔을 안전한 위치로 들어 올립니다...")
         
-        # 2. [1단계 이동] 현재 위치 -> 경유지 (안전하게 들기)
         steps = 20
         for i in range(1, steps + 1):
             interpolated_action = []
             for curr, target in zip(current_pos, SAFE_WAYPOINT):
-                step_val = curr + (target - curr) * (i / steps)
-                interpolated_action.append(step_val)
-            
-            # 정확한 모터 이름과 값을 1:1로 짝지어 전송
-            action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
-            robot.send_action(action_dict)
+                interpolated_action.append(curr + (target - curr) * (i / steps))
+                
+            robot.send_action({k: v for k, v in zip(JOINT_KEYS, interpolated_action)})
             time.sleep(0.03) 
             
         log_func("🏠 2단계: 최종 홈 포지션으로 부드럽게 접습니다...")
         
-        # 3. [2단계 이동] 경유지 -> 최종 홈 위치 (접기)
         for i in range(1, steps + 1):
             interpolated_action = []
             for curr, target in zip(SAFE_WAYPOINT, TARGET_HOME):
-                step_val = curr + (target - curr) * (i / steps)
-                interpolated_action.append(step_val)
-            
-            action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
-            robot.send_action(action_dict)
+                interpolated_action.append(curr + (target - curr) * (i / steps))
+                
+            robot.send_action({k: v for k, v in zip(JOINT_KEYS, interpolated_action)})
             time.sleep(0.03) 
             
         log_func("✅ 홈 복귀 완료. 수고하셨습니다!")
