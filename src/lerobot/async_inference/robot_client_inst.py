@@ -94,11 +94,12 @@ def return_to_home(robot, logger=None):
         current_pos = obs.get("position", obs.get("state")) 
         
         if current_pos is None:
-            log_func(" 현재 위치를 읽을 수 없어 바로 이동합니다.")
-            robot.send_action({"action": TARGET_HOME})
+            log_func("⚠️ 현재 위치를 읽을 수 없어 바로 이동합니다.")
+            action_dict = {key: val for key, val in zip(robot.action_features, TARGET_HOME)}
+            robot.send_action(action_dict)
             return
 
-        log_func(" 홈 포지션으로 부드럽게 복귀 중...")
+        log_func("🏠 홈 포지션으로 부드럽게 복귀 중...")
         
         # 2. 현재 위치 -> 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동
         steps = 30
@@ -108,7 +109,9 @@ def return_to_home(robot, logger=None):
                 step_val = curr + (target - curr) * (i / steps)
                 interpolated_action.append(step_val)
             
-            robot.send_action({"action": interpolated_action})
+            # 🚨 핵심 수정: 로봇 모터 이름에 맞춰 딕셔너리로 포장해서 보내기!
+            action_dict = {key: val for key, val in zip(robot.action_features, interpolated_action)}
+            robot.send_action(action_dict)
             time.sleep(0.03) 
             
         log_func("✅ 홈 복귀 완료.")
