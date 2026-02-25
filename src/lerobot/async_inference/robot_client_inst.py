@@ -42,6 +42,7 @@ from dataclasses import asdict
 from pprint import pformat
 from queue import Queue
 from typing import Any
+import numpy as np
 
 import draccus
 import grpc
@@ -98,28 +99,30 @@ def move_joint_smoothly(robot_arm, joint_name, target_pos, steps=100, delay=0.01
     except Exception as e:
         print(f"❌ [{joint_name}] 제어 중 오류 발생: {e}")
 
-def return_to_home(robot_arm):
+def return_to_home(robot_arm, logger=None):
     """
     로봇 팔을 안전하게 Home 포지션으로 복귀시킵니다.
-    지정된 순서(어깨 -> 팔꿈치 -> 손목)대로 천천히 이동하여 하드웨어 무리를 방지합니다.
     """
-    print("=== 🤖 Return to Home 시퀀스 시작 ===")
-    
-    # [손목]은 현재 상태를 유지하므로 이 단계에서는 제어하지 않습니다.
+    msg = "=== 🤖 Return to Home 시퀀스 시작 ==="
+    if logger:
+        logger.info(msg)
+    else:
+        print(msg)
     
     # 1. 어깨(shoulder_lift)를 2050으로 먼저 이동 
-    # (팔을 먼저 들어올려 바닥 충돌 방지)
     move_joint_smoothly(robot_arm, joint_name="shoulder_lift", target_pos=2050, steps=150, delay=0.02)
     
     # 2. 완료 후, 팔꿈치(elbow_flex)를 2050으로 이동
-    # (안전 공간 확보 후 팔꿈치 접기)
     move_joint_smoothly(robot_arm, joint_name="elbow_flex", target_pos=2050, steps=150, delay=0.02)
     
     # 3. 완료 후, 손목(wrist_flex)을 2000으로 이동
-    # (마지막 정렬)
     move_joint_smoothly(robot_arm, joint_name="wrist_flex", target_pos=2000, steps=100, delay=0.02)
     
-    print("=== ✅ Return to Home 시퀀스 완료 ===")
+    msg_done = "=== ✅ Return to Home 시퀀스 완료 ==="
+    if logger:
+        logger.info(msg_done)
+    else:
+        print(msg_done)
         
 class RobotClient:
     prefix = "robot_client"
