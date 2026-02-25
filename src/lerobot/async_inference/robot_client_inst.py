@@ -503,7 +503,7 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
 
-def control_loop(self, task: str, max_duration: int = 30, verbose: bool = False) -> tuple[Observation, Action]:
+    def control_loop(self, task: str, max_duration: int = 30, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
         self.start_barrier.wait()
         self.logger.info(f"Control loop thread starting (Max Duration: {max_duration}s)")
