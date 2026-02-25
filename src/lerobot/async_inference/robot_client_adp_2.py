@@ -553,7 +553,7 @@ def async_client(cfg: RobotClientConfig):
                 continue
 
             # 서버가 최초에 모델을 만들 때 필요한 필수 설정들을 그대로 유지
-            cfg.pretrained_name_or_path = user_input
+            # cfg.pretrained_name_or_path = user_input
             
             print(f"📡 VLM에 명령 전송 중: '{user_input}'")
 
