@@ -80,81 +80,29 @@ from .helpers import (
     visualize_action_queue_size,
 )
 
-def move_joint_smoothly(robot_arm, joint_name, target_pos, steps=100, delay=0.015):
-    """특정 조인트를 부드럽게 선형 보간으로 이동시킵니다. (LeRobot 호환)"""
-    try:
-        # 1. LeRobot API로 현재 딕셔너리 상태 가져오기
-        obs = robot_arm.get_observation()
-        
-        # (도우미 함수) PyTorch Tensor, Numpy Array, 리스트 등 어떤 값이 오든 스칼라(float)로 안전하게 변환
-        def _get_float(v):
-            if hasattr(v, "item"): return float(v.item())
-            if hasattr(v, "__len__") and not isinstance(v, str): return float(v[0])
-            return float(v)
-
-        # 2. 현재 움직일 관절의 위치 파악
-        if joint_name in obs:
-            current_pos = _get_float(obs[joint_name])
-        elif f"observation.{joint_name}" in obs:
-            current_pos = _get_float(obs[f"observation.{joint_name}"])
-        else:
-            raise KeyError(f"'{joint_name}' 키를 찾을 수 없습니다. (현재 존재하는 키: {list(obs.keys())})")
-            
-        # 3. 선형 보간 궤적 생성
-        trajectory = np.linspace(current_pos, target_pos, steps)
-        print(f"▶ [{joint_name}] 이동: {current_pos:.1f} -> {target_pos}")
-        
-        # 4. send_action에 넣을 전체 관절 키 리스트 추출 (사용자 원본 코드 로직 응용)
-        action_keys = list(robot_arm.action_features.keys()) if isinstance(robot_arm.action_features, dict) else list(robot_arm.action_features)
-        
-        # 5. 궤적을 따라 이동 수행
-        for pos in trajectory:
-            action_dict = {}
-            for k in action_keys:
-                if k == joint_name:
-                    # 목표 관절은 궤적(trajectory)의 값을 넣음
-                    action_dict[k] = float(pos)
-                else:
-                    # 목표가 아닌 나머지 관절들은 현재 위치를 그대로 복사해서 넣음
-                    obs_k = k if k in obs else f"observation.{k}"
-                    action_dict[k] = _get_float(obs.get(obs_k, 0.0))
-            
-            # 완성된 딕셔너리를 전송!
-            robot_arm.send_action(action_dict)
-            time.sleep(delay)
-            
-    except Exception as e:
-        print(f"❌ [{joint_name}] 제어 중 오류 발생: {e}")
-
-
 def return_to_home(robot, logger=None):
-    """검증된 딕셔너리 매핑 방식을 사용한 순차적 복귀 함수"""
+    """이름 매칭(.pos) 및 각도 기반 순차적 복귀 함수"""
     import time
     log_func = logger.info if logger else print
 
     log_func("\n=== 🤖 Return to Home (순차적 복귀) 시작 ===")
 
     try:
-        # 1. 로봇이 현재 가지고 있는 모터 이름 싹 다 가져오기 (원래 코드 방식)
         JOINT_KEYS = list(robot.action_features)
         obs = robot.get_observation()
         
-        # 2. 현재 모든 모터의 위치를 딕셔너리로 안전하게 추출
         current_state = {}
         for key in JOINT_KEYS:
             if key in obs:
                 val = obs[key]
-                if hasattr(val, "item"): val = val.item() # 텐서 처리
+                if hasattr(val, "item"): val = val.item()
                 current_state[key] = float(val)
             else:
-                log_func(f"❌ 앗! '{key}' 값을 찾을 수 없습니다. 복귀를 취소합니다.")
+                log_func(f"❌ '{key}' 값을 찾을 수 없습니다.")
                 return
 
         log_func(f"📊 현재 위치: [ {', '.join(f'{k}: {v:.1f}' for k, v in current_state.items())} ]")
 
-        # ---------------------------------------------------------
-        # 💡 핵심: 특정 모터만 목표값으로 천천히 이동시키는 내부 함수
-        # ---------------------------------------------------------
         def move_single_joint(target_joint_name, target_value, steps=30, sleep_time=0.02):
             if target_joint_name not in current_state:
                 log_func(f"⚠️ '{target_joint_name}' 모터를 찾을 수 없어 건너뜁니다.")
@@ -162,40 +110,34 @@ def return_to_home(robot, logger=None):
 
             log_func(f"▶ [{target_joint_name}] 이동 중: {current_state[target_joint_name]:.1f} -> {target_value}")
 
-            # 목표 상태(Target State) 딕셔너리 만들기 (움직일 관절만 값 변경)
             target_state = current_state.copy()
             target_state[target_joint_name] = target_value
 
-            # 스텝 수만큼 쪼개서 부드럽게 이동
             for i in range(1, steps + 1):
                 action_dict = {}
                 for key in JOINT_KEYS:
                     start_val = current_state[key]
                     end_val = target_state[key]
-                    # 선형 보간 (현재 위치에서 목표 위치로 쪼개서 전송)
                     action_dict[key] = start_val + (end_val - start_val) * (i / steps)
 
-                # 원래 작동하던 그 완벽한 방식으로 전송!
                 robot.send_action(action_dict)
                 time.sleep(sleep_time)
 
-            # 이동 완료 후, 현재 상태 업데이트
             current_state[target_joint_name] = float(target_value)
 
         # ---------------------------------------------------------
-        # 🧗 3단계 순차적 제어 실행
+        # 🧗 3단계 순차적 제어 실행 (.pos 추가 및 각도(Degrees) 값 적용)
         # ---------------------------------------------------------
-        # step 수와 sleep_time을 조절하여 속도를 제어할 수 있습니다.
-        # 예: steps=40, sleep_time=0.02 이면 한 관절당 약 0.8초 소요
+        # 🚨 경고: 아래 0.0 값들을 실제 로봇의 '만세 자세 각도'로 수정하셔야 합니다!
         
-        # 1. 어깨 먼저 들어올리기
-        move_single_joint("shoulder_lift", 2050.0, steps=40)
+        # 1. 어깨 먼저 들어올리기 (기존 2050 -> 약 0.0도 가정)
+        move_single_joint("shoulder_lift.pos", 0.0, steps=40)
         
-        # 2. 어깨 완료 후 팔꿈치 접기
-        move_single_joint("elbow_flex", 2050.0, steps=40)
+        # 2. 어깨 완료 후 팔꿈치 접기 (기존 2050 -> 약 0.0도 가정)
+        move_single_joint("elbow_flex.pos", 0.0, steps=40)
         
-        # 3. 팔꿈치 완료 후 손목 정렬
-        move_single_joint("wrist_flex", 2000.0, steps=40)
+        # 3. 팔꿈치 완료 후 손목 정렬 (기존 2000 -> 약 -10.0도 가정)
+        move_single_joint("wrist_flex.pos", 0.0, steps=40)
 
         log_func("=== ✅ 순차적 홈 복귀 완료. 수고하셨습니다! ===")
 
