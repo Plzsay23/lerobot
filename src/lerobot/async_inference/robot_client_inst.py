@@ -81,17 +81,23 @@ from .helpers import (
 )
 
 def return_to_home(robot, logger=None):
-    """현재 위치에서 설정된 기본 상태값(접힌 상태)으로 순차적이고 부드럽게 이동합니다."""
+    """중간 만세 자세를 거쳐 최종 기본 자세로 부드럽게 복귀합니다."""
     import time
     log_func = logger.info if logger else print
     
-    # 🚨 [매우 중요] 현재 로봇은 2000대 숫자가 아닌 '각도(Degree)'를 씁니다.
-    # 베이스 -> 어깨 -> 팔꿈치 -> 손목 -> 손목회전 -> 그리퍼 순서입니다.
-    # 우선 안전한 만세 자세(모두 0.0도)로 설정했습니다. 필요시 직접 각도를 수정하세요.
-    TARGET_HOME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] 
+    # 💡 다이나믹셀 Raw 값(0~4096)을 LeRobot 각도(Degree)로 자동 변환하는 헬퍼 함수
+    def raw_to_deg(raw_val):
+        return (raw_val - 2048) * (360.0 / 4096.0)
+    
+    # 알려주신 최종 기본 자세 (접힌 상태) Raw 좌표
+    FINAL_RAW = [2128, 872, 3184, 2708, 1870, 1540]
+    
+    # 코드가 안전하게 읽을 수 있도록 각도로 일괄 변환
+    # (예: 872 -> 약 -103도, 3184 -> 약 +99.8도)
+    FINAL_DEG = [raw_to_deg(v) for v in FINAL_RAW]
     
     try:
-        # 1. 로봇의 현재 관절 각도를 읽어옵니다. (로그에 찍힌 평면적 키 구조에 맞게 수정)
+        # 1. 로봇의 현재 관절 각도 읽어오기
         obs = robot.get_observation()
         JOINT_KEYS = list(robot.action_features)
         
@@ -99,51 +105,55 @@ def return_to_home(robot, logger=None):
         for key in JOINT_KEYS:
             if key in obs:
                 val = obs[key]
-                if hasattr(val, "item"): val = val.item() # 텐서 변환 방어
+                if hasattr(val, "item"): val = val.item()
                 current_pos.append(float(val))
             else:
                 log_func(f"⚠️ '{key}' 위치를 읽을 수 없어 복귀를 취소합니다.")
                 return
 
-        log_func(f"🏠 홈 포지션으로 순차적 복귀 중... (시작 위치: {current_pos})")
+        log_func(f"\n🤖 2단계 안전 복귀 시퀀스 시작...")
         
         steps = 30
         sleep_time = 0.03
-        
-        # -------------------------------------------------------------
-        # 💡 순차적 이동 로직 (어깨 -> 팔꿈치 -> 손목)
-        # -------------------------------------------------------------
-        # LeRobot SO-100/101의 기본 인덱스: 1(어깨), 2(팔꿈치), 3(손목)
-        sequence_indices = [1, 2, 3]
-        sequence_names = ["어깨(shoulder_lift)", "팔꿈치(elbow_flex)", "손목(wrist_flex)"]
-        
-        # 이동 중 위치를 계속 추적할 리스트
         working_pos = list(current_pos)
         
+        # -------------------------------------------------------------
+        # 🧗 [1단계] 순차적 중간 자세 (충돌 방지를 위해 일어서기)
+        # -------------------------------------------------------------
+        log_func("🧗 [1단계] 테이블 충돌 방지를 위해 팔을 안전하게 들어 올립니다.")
+        sequence_indices = [1, 2, 3] # 어깨(1), 팔꿈치(2), 손목(3)
+        sequence_names = ["어깨", "팔꿈치", "손목"]
+        
         for step_idx, joint_idx in enumerate(sequence_indices):
-            log_func(f"▶ {sequence_names[step_idx]} 이동 중...")
-            
-            # 이번 단계의 목표 위치 리스트 (움직일 관절 하나만 TARGET_HOME 값으로 바꿈)
             step_target_pos = list(working_pos)
-            step_target_pos[joint_idx] = TARGET_HOME[joint_idx]
+            step_target_pos[joint_idx] = 0.0  # 만세 자세 (0도)
             
-            # 2. 현재 위치 -> 이번 단계 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동
             for i in range(1, steps + 1):
                 interpolated_action = []
-                # 원래 쓰셨던 zip(curr, target) 구조 그대로 사용!
                 for curr, target in zip(working_pos, step_target_pos):
-                    step_val = curr + (target - curr) * (i / steps)
-                    interpolated_action.append(step_val)
+                    interpolated_action.append(curr + (target - curr) * (i / steps))
                 
-                # 🚨 로봇 모터 이름에 맞춰 딕셔너리로 포장해서 보내기
                 action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
                 robot.send_action(action_dict)
                 time.sleep(sleep_time)
                 
-            # 한 관절의 이동이 완전히 끝나면, 현재 위치(working_pos)를 업데이트
             working_pos = list(step_target_pos)
             
-        log_func("✅ 홈 복귀 완료.")
+        # -------------------------------------------------------------
+        # 📦 [2단계] 다같이 부드럽게 접기 (최종 기본 자세)
+        # -------------------------------------------------------------
+        log_func("📦 [2단계] 알려주신 최종 기본 자세로 부드럽게 접습니다.")
+        
+        for i in range(1, steps + 1):
+            interpolated_action = []
+            for curr, target in zip(working_pos, FINAL_DEG):
+                interpolated_action.append(curr + (target - curr) * (i / steps))
+            
+            action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
+            robot.send_action(action_dict)
+            time.sleep(sleep_time)
+            
+        log_func("✅ 최종 기본 자세 복귀 완벽하게 완료!")
         
     except Exception as e:
         log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
