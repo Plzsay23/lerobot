@@ -80,20 +80,29 @@ from .helpers import (
     visualize_action_queue_size,
 )
 
-def move_joint_smoothly(robot_arm, joint_name, target_pos, steps=100, delay=0.015):
-    """특정 조인트를 부드럽게 선형 보간으로 이동시킵니다."""
+def move_joint_smoothly(robot_arm, joint_index, joint_name, target_pos, steps=100, delay=0.015):
+    """특정 조인트를 부드럽게 선형 보간으로 이동시킵니다. (LeRobot API 호환)"""
     try:
-        # 현재 위치 읽기
-        current_pos = robot_arm.get_joint_position(joint_name)
+        # 1. LeRobot API로 현재 전체 상태 가져오기
+        obs = robot_arm.get_observation()
         
-        # 선형 보간 궤적 생성
+        # LeRobot은 보통 'observation.state' 키에 전체 관절 값을 배열로 저장합니다.
+        state_key = "observation.state" if "observation.state" in obs else "state"
+        current_state = np.array(obs[state_key], dtype=np.float32)
+        
+        # 2. 제어할 특정 조인트의 현재 위치 추출
+        current_pos = current_state[joint_index]
         trajectory = np.linspace(current_pos, target_pos, steps)
         
-        print(f"▶ [{joint_name}] Home 이동: {current_pos:.1f} -> {target_pos}")
+        print(f"▶ [{joint_name} (idx:{joint_index})] 이동: {current_pos:.1f} -> {target_pos}")
         
-        # 궤적을 따라 모터 제어
+        # 3. 궤적을 따라 전체 상태 배열을 덮어씌우며 전송
         for pos in trajectory:
-            robot_arm.set_joint_position(joint_name, int(pos))
+            action_state = current_state.copy()
+            action_state[joint_index] = pos
+            
+            # LeRobot의 send_action은 "action" 키 안에 전체 배열을 담아 보냅니다.
+            robot_arm.send_action({"action": action_state})
             time.sleep(delay)
             
     except Exception as e:
@@ -109,14 +118,17 @@ def return_to_home(robot_arm, logger=None):
     else:
         print(msg)
     
-    # 1. 어깨(shoulder_lift)를 2050으로 먼저 이동 
-    move_joint_smoothly(robot_arm, joint_name="shoulder_lift", target_pos=2050, steps=150, delay=0.02)
+    # ⚠️ 경고: 아래 target_pos 값이 LeRobot의 단위(보통 Degrees)에 맞는지 꼭 확인하세요!
+    # 만약 기존 코드가 Raw Value(0~4096)를 썼다면, 변환 공식을 거쳐야 합니다.
     
-    # 2. 완료 후, 팔꿈치(elbow_flex)를 2050으로 이동
-    move_joint_smoothly(robot_arm, joint_name="elbow_flex", target_pos=2050, steps=150, delay=0.02)
+    # 1. 어깨 (shoulder_lift -> index 1)
+    move_joint_smoothly(robot_arm, joint_index=1, joint_name="shoulder_lift", target_pos=2050, steps=150, delay=0.02)
     
-    # 3. 완료 후, 손목(wrist_flex)을 2000으로 이동
-    move_joint_smoothly(robot_arm, joint_name="wrist_flex", target_pos=2000, steps=100, delay=0.02)
+    # 2. 팔꿈치 (elbow_flex -> index 2)
+    move_joint_smoothly(robot_arm, joint_index=2, joint_name="elbow_flex", target_pos=2050, steps=150, delay=0.02)
+    
+    # 3. 손목 (wrist_flex -> index 3)
+    move_joint_smoothly(robot_arm, joint_index=3, joint_name="wrist_flex", target_pos=2000, steps=100, delay=0.02)
     
     msg_done = "=== ✅ Return to Home 시퀀스 완료 ==="
     if logger:
