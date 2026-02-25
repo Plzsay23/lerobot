@@ -80,36 +80,55 @@ from .helpers import (
 )
 
 def return_to_home(robot, logger=None):
-    """현재 위치에서 설정된 기본 상태값(접힌 상태)으로 부드럽게 이동합니다."""
+    """안전한 경유지를 거쳐 기본 상태값(접힌 상태)으로 부드럽게 이동합니다."""
     import time
     log_func = logger.info if logger else print
     
-    # 베이스-> 그리퍼 순서의 목표 각도값
+    # 🎯 최종 목적지 (접힌 상태)
     TARGET_HOME = [2128, 872, 3184, 2708, 1870, 1540]
     
+    # 🛑 1단계 경유지 (팔을 위로 뻗은 안전한 자세)
+    # 베이스와 그리퍼는 그대로 두고, 어깨~손목 관절만 중간값(약 2048) 근처로 세워서 바닥/몸통 충돌을 막습니다.
+    SAFE_WAYPOINT = [2128, 2048, 2048, 2048, 1870, 1540]
+    
     try:
-        # 1. 로봇의 현재 관절 각도를 읽어옵니다.
         obs = robot.get_observation()
-        # SO-100 모델 환경에 맞게 키 값 확인
         current_pos = obs.get("position", obs.get("state")) 
         
+        # 만약 current_pos가 PyTorch 텐서(Tensor) 형태라면 일반 리스트로 변환 (값 꼬임 방지)
+        if hasattr(current_pos, "tolist"):
+            current_pos = current_pos.tolist()
+            
         if current_pos is None:
             log_func("⚠️ 현재 위치를 읽을 수 없어 바로 이동합니다.")
             action_dict = {key: val for key, val in zip(robot.action_features, TARGET_HOME)}
             robot.send_action(action_dict)
             return
 
-        log_func("🏠 홈 포지션으로 부드럽게 복귀 중...")
+        log_func(f"📊 현재 로봇 위치: [ {', '.join(f'{x:.1f}' for x in current_pos)} ]")
+        log_func("🧗 1단계: 충돌을 피하기 위해 팔을 안전한 위치로 들어 올립니다...")
         
-        # 2. 현재 위치 -> 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동
-        steps = 30
+        steps = 20
+        # [1단계 이동] 현재 위치 -> 경유지 (안전하게 들기)
         for i in range(1, steps + 1):
             interpolated_action = []
-            for curr, target in zip(current_pos, TARGET_HOME):
+            for curr, target in zip(current_pos, SAFE_WAYPOINT):
                 step_val = curr + (target - curr) * (i / steps)
                 interpolated_action.append(step_val)
             
-            # 🚨 핵심 수정: 로봇 모터 이름에 맞춰 딕셔너리로 포장해서 보내기!
+            action_dict = {key: val for key, val in zip(robot.action_features, interpolated_action)}
+            robot.send_action(action_dict)
+            time.sleep(0.03) 
+            
+        log_func("🏠 2단계: 최종 홈 포지션으로 부드럽게 접습니다...")
+        
+        # [2단계 이동] 경유지 -> 최종 홈 위치 (접기)
+        for i in range(1, steps + 1):
+            interpolated_action = []
+            for curr, target in zip(SAFE_WAYPOINT, TARGET_HOME):
+                step_val = curr + (target - curr) * (i / steps)
+                interpolated_action.append(step_val)
+            
             action_dict = {key: val for key, val in zip(robot.action_features, interpolated_action)}
             robot.send_action(action_dict)
             time.sleep(0.03) 
