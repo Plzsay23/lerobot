@@ -80,52 +80,61 @@ from .helpers import (
 )
 
 def return_to_home(robot, logger=None):
-    """안전한 경유지를 거쳐 기본 상태값(접힌 상태)으로 부드럽게 이동합니다."""
+    """[디버깅 모드] 이동 전 값들을 철저히 분석합니다."""
     import time
     log_func = logger.info if logger else print
     
-    # 🎯 최종 목적지 (접힌 상태)
     TARGET_HOME = [2128, 872, 3184, 2708, 1870, 1540]
     
-    # 🛑 1단계 경유지 (팔을 위로 뻗은 안전한 자세)
-    # 베이스와 그리퍼는 그대로 두고, 어깨~손목 관절만 중간값(약 2048) 근처로 세워서 바닥/몸통 충돌을 막습니다.
-    SAFE_WAYPOINT = [2128, 2048, 2048, 2048, 1870, 1540]
-    
     try:
+        log_func("\n" + "="*40)
+        log_func("🛑 [디버깅] 홈 복귀 시퀀스 분석 시작")
+        
+        # 1. 로봇 상태 읽기
         obs = robot.get_observation()
         current_pos = obs.get("position", obs.get("state")) 
         
-        # 만약 current_pos가 PyTorch 텐서(Tensor) 형태라면 일반 리스트로 변환 (값 꼬임 방지)
+        # [수사 1] 원본 데이터 정체 파악
+        log_func(f"🔍 1. 원본 current_pos 타입: {type(current_pos)}")
+        log_func(f"🔍 2. 원본 current_pos 값: {current_pos}")
+        
+        # 텐서나 넘파이 배열이라면 리스트로 펴주기
         if hasattr(current_pos, "tolist"):
             current_pos = current_pos.tolist()
             
-        if current_pos is None:
-            log_func("⚠️ 현재 위치를 읽을 수 없어 바로 이동합니다.")
-            action_dict = {key: val for key, val in zip(robot.action_features, TARGET_HOME)}
-            robot.send_action(action_dict)
-            return
-
-        log_func(f"📊 현재 로봇 위치: [ {', '.join(f'{x:.1f}' for x in current_pos)} ]")
-        log_func("🧗 1단계: 충돌을 피하기 위해 팔을 안전한 위치로 들어 올립니다...")
+        # 혹시 [[...]] 처럼 이중 리스트로 되어 있다면 한 겹 벗기기
+        if isinstance(current_pos, list) and len(current_pos) > 0 and isinstance(current_pos[0], list):
+            current_pos = current_pos[0]
+            
+        log_func(f"🔍 3. 1차원 변환 후 current_pos: {current_pos}")
+        log_func(f"🔍 4. 우리가 설정한 TARGET_HOME: {TARGET_HOME}")
+        log_func(f"🔍 5. 로봇의 액션 순서(features): {robot.action_features}")
         
-        steps = 20
-        # [1단계 이동] 현재 위치 -> 경유지 (안전하게 들기)
+        # 검증: 데이터 개수가 6개가 맞는지
+        if current_pos is None or len(current_pos) != len(TARGET_HOME):
+            log_func(f"❌ 데이터 길이 불일치! (현재위치 길이: {len(current_pos) if current_pos else 0} / 목표 길이: 6)")
+            return  # 위험하니 여기서 중단
+            
+        # [수사 2] 첫 번째 스텝 연산 결과 미리보기 (갑자기 값이 확 튀는지 확인)
+        step_1_action = []
+        for curr, target in zip(current_pos, TARGET_HOME):
+            step_val = curr + (target - curr) * (1 / 30) # 30단계 중 1단계
+            step_1_action.append(round(step_val, 2))
+            
+        log_func(f"🔍 6. [위험 체크] Step 1 이동 예정 값: {step_1_action}")
+        log_func("="*40)
+        
+        # 로봇이 튀기 전에 3초간 생각할(강제종료할) 시간을 줍니다.
+        log_func("⏳ 3초 대기 중... 로그를 확인하세요! 값이 이상하면 즉시 터미널을 강제종료(Ctrl+C 연타) 하세요!")
+        time.sleep(3)
+        
+        log_func("🚀 이동 시작!")
+        
+        # 기존 이동 로직 (경유지 없이 다이렉트로 가보며 테스트)
+        steps = 30
         for i in range(1, steps + 1):
             interpolated_action = []
-            for curr, target in zip(current_pos, SAFE_WAYPOINT):
-                step_val = curr + (target - curr) * (i / steps)
-                interpolated_action.append(step_val)
-            
-            action_dict = {key: val for key, val in zip(robot.action_features, interpolated_action)}
-            robot.send_action(action_dict)
-            time.sleep(0.03) 
-            
-        log_func("🏠 2단계: 최종 홈 포지션으로 부드럽게 접습니다...")
-        
-        # [2단계 이동] 경유지 -> 최종 홈 위치 (접기)
-        for i in range(1, steps + 1):
-            interpolated_action = []
-            for curr, target in zip(SAFE_WAYPOINT, TARGET_HOME):
+            for curr, target in zip(current_pos, TARGET_HOME):
                 step_val = curr + (target - curr) * (i / steps)
                 interpolated_action.append(step_val)
             
@@ -136,7 +145,7 @@ def return_to_home(robot, logger=None):
         log_func("✅ 홈 복귀 완료.")
         
     except Exception as e:
-        log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
+        log_func(f"❌ 홈 복귀 디버깅 중 에러 발생: {e}")
         
 class RobotClient:
     prefix = "robot_client"
