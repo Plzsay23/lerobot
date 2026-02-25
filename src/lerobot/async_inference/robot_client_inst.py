@@ -79,7 +79,43 @@ from .helpers import (
     visualize_action_queue_size,
 )
 
+def return_to_home(robot, logger=None):
+    """현재 위치에서 설정된 기본 상태값(접힌 상태)으로 부드럽게 이동합니다."""
+    import time
+    log_func = logger.info if logger else print
+    
+    # 베이스-> 그리퍼 순서의 목표 각도값
+    TARGET_HOME = [2128, 872, 3184, 2708, 1870, 1540]
+    
+    try:
+        # 1. 로봇의 현재 관절 각도를 읽어옵니다.
+        obs = robot.get_observation()
+        # SO-100 모델 환경에 맞게 키 값 확인
+        current_pos = obs.get("position", obs.get("state")) 
+        
+        if current_pos is None:
+            log_func(" 현재 위치를 읽을 수 없어 바로 이동합니다.")
+            robot.send_action({"action": TARGET_HOME})
+            return
 
+        log_func(" 홈 포지션으로 부드럽게 복귀 중...")
+        
+        # 2. 현재 위치 -> 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동
+        steps = 30
+        for i in range(1, steps + 1):
+            interpolated_action = []
+            for curr, target in zip(current_pos, TARGET_HOME):
+                step_val = curr + (target - curr) * (i / steps)
+                interpolated_action.append(step_val)
+            
+            robot.send_action({"action": interpolated_action})
+            time.sleep(0.03) 
+            
+        log_func("✅ 홈 복귀 완료.")
+        
+    except Exception as e:
+        log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
+        
 class RobotClient:
     prefix = "robot_client"
     logger = get_logger(prefix)
@@ -464,31 +500,35 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
 
-    def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
+    def control_loop(self, task: str, max_duration: int = 30, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
-        # Wait at barrier for synchronized start
         self.start_barrier.wait()
-        self.logger.info("Control loop thread starting")
-
+        self.logger.info(f"Control loop thread starting (Max Duration: {max_duration}s)")
+    
         _performed_action = None
         _captured_observation = None
-
+    
+        start_time = time.time()  # 시작 시간 기록
+    
         while self.running:
-            control_loop_start = time.perf_counter()
-            """Control loop: (1) Performing actions, when available"""
-            if self.actions_available():
-                _performed_action = self.control_loop_action(verbose)
-
-            """Control loop: (2) Streaming observations to the remote policy server"""
-            if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
-
-            self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
-            # Dynamically adjust sleep time to maintain the desired control frequency
-            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+            # [추가된 로직] 지정된 시간 초과 시 작업 완료(또는 실패)로 간주하고 루프 탈출
+            if max_duration > 0 and (time.time() - start_time) > max_duration:
+                self.logger.info(f" 타임아웃({max_duration}초) 도달. 작업을 종료합니다.")
+                break
+                control_loop_start = time.perf_counter()
+                """Control loop: (1) Performing actions, when available"""
+                if self.actions_available():
+                    _performed_action = self.control_loop_action(verbose)
+    
+                """Control loop: (2) Streaming observations to the remote policy server"""
+                if self._ready_to_send_observation():
+                    _captured_observation = self.control_loop_observation(task, verbose)
+    
+                self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
+                # Dynamically adjust sleep time to maintain the desired control frequency
+                time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
 
         return _captured_observation, _performed_action
-
 
 @draccus.wrap()
 def async_client(cfg: RobotClientConfig):
@@ -512,58 +552,54 @@ def async_client(cfg: RobotClientConfig):
     # 2. 메인 루프 (입력 -> 실행 -> 중단 -> 반복)
     while True:
         try:
-            print("\n명령을 입력하세요 (종료하려면 'exit' 입력)")
-            user_instruction = input(">>> ")
+            print("\n[VLM 대기] 태스크를 입력하세요 (형식: '[번호] [내용]', 예: '1 pick up')")
+            user_input = input(">>> ").strip()
             
-            if user_instruction.lower() in ["exit", "quit"]:
-                print("시스템을 종료합니다.")
+            if user_input.lower() in ["exit", "quit"]:
                 break
             
-            if not user_instruction.strip():
+            if not user_input:
                 continue
 
-            # 설정에 명령어 반영
-            cfg.task = user_instruction
+            # 서버가 최초에 모델을 만들 때 필요한 필수 설정들을 그대로 유지
+            # cfg.pretrained_name_or_path = user_input
             
-            print(f"실행 중: '{user_instruction}'")
-            print("   (중단하고 다시 명령을 내리려면 'Ctrl + C'를 누르세요)")
+            print(f"📡 VLM에 명령 전송 중: '{user_input}'")
 
-            # 3. 클라이언트 생성 (미리 만든 shared_robot을 주입!)
+            # 클라이언트 생성 시 기존 cfg(policy_type 등 포함)를 그대로 사용
             client = RobotClient(cfg, robot=shared_robot)
-            
-            # 명령어 변수 확실하게 설정
-            client.set_instruction(user_instruction)
+            client.set_instruction(user_input)
 
             if client.start():
-                client.logger.info("Starting action receiver thread...")
                 action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
                 action_receiver_thread.start()
-
+    
                 try:
-                    # 로봇 실행 (Ctrl+C를 누를 때까지 여기서 멈춤)
-                    client.control_loop(task=user_instruction)
-
+                    # 제어 루프 진입 (30초 타임아웃 설정)
+                    client.control_loop(task=user_input, max_duration=30)
+    
+                    #  [상황 1 & 2] 루프가 무사히 끝났거나, 타임아웃으로 끝남 (성공/실패 판단 후 복귀)
+                    print("\\n 작업(또는 시간)이 종료되었습니다. 초기 위치로 복귀합니다.")
+                    return_to_home(shared_robot, client.logger)
+    
                 except KeyboardInterrupt:
-                    print("\n동작 정지! 대기 모드로 전환합니다.")
-                    # 안전 정지 코드가 있다면 여기서 호출 (예: shared_robot.teleop_safety_stop())
-                    
+                    #  [상황 3] 사람이 직접 중단함 (긴급 정지)
+                    print("\\n 긴급 정지 감지! 로봇을 안전하게 초기 위치로 복귀시킵니다.")
+                    return_to_home(shared_robot, client.logger)
+    
                 finally:
-                    # 이번 세션 종료 (로봇 연결은 끊지 않음)
+                    # 통신 종료 (모델은 서버 램에 유지)
                     client.shutdown_event.set()
-                    client.channel.close() # 서버와의 통신만 닫음
+                    client.channel.close()
                     if action_receiver_thread.is_alive():
                         action_receiver_thread.join(timeout=1.0)
                         
         except Exception as e:
             print(f"오류 발생: {e}")
-            import traceback
-            traceback.print_exc()
-            break
             
     # 프로그램 종료 시 로봇 연결 해제
     if 'shared_robot' in locals():
         shared_robot.disconnect()
-
 
 if __name__ == "__main__":
     async_client()  # run the client
