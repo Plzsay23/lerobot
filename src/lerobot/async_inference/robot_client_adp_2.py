@@ -15,9 +15,13 @@ import torch
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.robots import (  # noqa: F401
-Robot,
-RobotConfig,
-make_robot_from_config,
+    Robot,
+    RobotConfig,
+    bi_so_follower,
+    koch_follower,
+    make_robot_from_config,
+    omx_follower,
+    so_follower,
 )
 from lerobot.transport import (
 services_pb2,  # type: ignore
@@ -54,11 +58,11 @@ def return_to_home(robot, logger=None):
         current_pos = obs.get("position", obs.get("state")) 
         
         if current_pos is None:
-            log_func("⚠️ 현재 위치를 읽을 수 없어 바로 이동합니다.")
+            log_func(" 현재 위치를 읽을 수 없어 바로 이동합니다.")
             robot.send_action({"action": TARGET_HOME})
             return
     
-        log_func("🏠 홈 포지션으로 부드럽게 복귀 중...")
+        log_func(" 홈 포지션으로 부드럽게 복귀 중...")
         
         # 2. 현재 위치 -> 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동 (약 1초 소요)
         steps = 30
