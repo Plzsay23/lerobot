@@ -42,6 +42,7 @@ from dataclasses import asdict
 from pprint import pformat
 from queue import Queue
 from typing import Any
+import numpy as np
 
 import draccus
 import grpc
@@ -80,29 +81,82 @@ from .helpers import (
 )
 
 def return_to_home(robot, logger=None):
-    """[값 추출 모드] 로봇을 움직이지 않고 현재 관절 숫자만 화면에 출력합니다."""
+    """중간 만세 자세를 거쳐 최종 기본 자세로 부드럽게 복귀합니다."""
+    import time
     log_func = logger.info if logger else print
     
+    # 💡 다이나믹셀 Raw 값(0~4096)을 LeRobot 각도(Degree)로 자동 변환하는 헬퍼 함수
+    def raw_to_deg(raw_val):
+        return (raw_val - 2048) * (360.0 / 4096.0)
+    
+    # 알려주신 최종 기본 자세 (접힌 상태) Raw 좌표
+    FINAL_RAW = [2128, 872, 3184, 2708, 1870, 1540]
+    
+    # 코드가 안전하게 읽을 수 있도록 각도로 일괄 변환
+    # (예: 872 -> 약 -103도, 3184 -> 약 +99.8도)
+    FINAL_DEG = [raw_to_deg(v) for v in FINAL_RAW]
+    
     try:
-        JOINT_KEYS = list(robot.action_features)
+        # 1. 로봇의 현재 관절 각도 읽어오기
         obs = robot.get_observation()
+        JOINT_KEYS = list(robot.action_features)
         
         current_pos = []
         for key in JOINT_KEYS:
-            val = obs[key]
-            if hasattr(val, "item"): val = val.item()
-            current_pos.append(int(val)) # 깔끔하게 정수로 출력
-            
-        log_func("\n" + "📸"*20)
-        log_func("현재 로봇 관절 숫자입니다! 이 리스트를 복사하세요:")
-        log_func(f"{current_pos}")
-        log_func("📸"*20 + "\n")
+            if key in obs:
+                val = obs[key]
+                if hasattr(val, "item"): val = val.item()
+                current_pos.append(float(val))
+            else:
+                log_func(f"⚠️ '{key}' 위치를 읽을 수 없어 복귀를 취소합니다.")
+                return
+
+        log_func(f"\n🤖 2단계 안전 복귀 시퀀스 시작...")
         
-        # 🚨 여기서 return을 해서 모터가 절대 안 움직이게 막습니다!
-        return 
+        steps = 30
+        sleep_time = 0.03
+        working_pos = list(current_pos)
+        
+        # -------------------------------------------------------------
+        # 🧗 [1단계] 순차적 중간 자세 (충돌 방지를 위해 일어서기)
+        # -------------------------------------------------------------
+        log_func("🧗 [1단계] 테이블 충돌 방지를 위해 팔을 안전하게 들어 올립니다.")
+        sequence_indices = [1, 2, 3] # 어깨(1), 팔꿈치(2), 손목(3)
+        sequence_names = ["어깨", "팔꿈치", "손목"]
+        
+        for step_idx, joint_idx in enumerate(sequence_indices):
+            step_target_pos = list(working_pos)
+            step_target_pos[joint_idx] = 0.0  # 만세 자세 (0도)
+            
+            for i in range(1, steps + 1):
+                interpolated_action = []
+                for curr, target in zip(working_pos, step_target_pos):
+                    interpolated_action.append(curr + (target - curr) * (i / steps))
+                
+                action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
+                robot.send_action(action_dict)
+                time.sleep(sleep_time)
+                
+            working_pos = list(step_target_pos)
+            
+        # -------------------------------------------------------------
+        # 📦 [2단계] 다같이 부드럽게 접기 (최종 기본 자세)
+        # -------------------------------------------------------------
+        log_func("📦 [2단계] 알려주신 최종 기본 자세로 부드럽게 접습니다.")
+        
+        for i in range(1, steps + 1):
+            interpolated_action = []
+            for curr, target in zip(working_pos, FINAL_DEG):
+                interpolated_action.append(curr + (target - curr) * (i / steps))
+            
+            action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
+            robot.send_action(action_dict)
+            time.sleep(sleep_time)
+            
+        log_func("✅ 최종 기본 자세 복귀 완벽하게 완료!")
         
     except Exception as e:
-        log_func(f"❌ 에러 발생: {e}")
+        log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
         
 class RobotClient:
     prefix = "robot_client"
