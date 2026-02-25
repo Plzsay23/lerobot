@@ -503,7 +503,7 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
 
-    def control_loop(self, task: str, max_duration: int = 30, verbose: bool = False) -> tuple[Observation, Action]:
+def control_loop(self, task: str, max_duration: int = 30, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
         self.start_barrier.wait()
         self.logger.info(f"Control loop thread starting (Max Duration: {max_duration}s)")
@@ -514,22 +514,24 @@ class RobotClient:
         start_time = time.time()  # 시작 시간 기록
     
         while self.running:
-            # [추가된 로직] 지정된 시간 초과 시 작업 완료(또는 실패)로 간주하고 루프 탈출
+            # [추가된 로직] 지정된 시간 초과 시 루프 탈출
             if max_duration > 0 and (time.time() - start_time) > max_duration:
                 self.logger.info(f" 타임아웃({max_duration}초) 도달. 작업을 종료합니다.")
                 break
-                control_loop_start = time.perf_counter()
-                """Control loop: (1) Performing actions, when available"""
-                if self.actions_available():
-                    _performed_action = self.control_loop_action(verbose)
+            
+            control_loop_start = time.perf_counter()
+            
+            """Control loop: (1) Performing actions, when available"""
+            if self.actions_available():
+                _performed_action = self.control_loop_action(verbose)
     
-                """Control loop: (2) Streaming observations to the remote policy server"""
-                if self._ready_to_send_observation():
-                    _captured_observation = self.control_loop_observation(task, verbose)
+            """Control loop: (2) Streaming observations to the remote policy server"""
+            if self._ready_to_send_observation():
+                _captured_observation = self.control_loop_observation(task, verbose)
     
-                self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
-                # Dynamically adjust sleep time to maintain the desired control frequency
-                time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+            self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
+            # Dynamically adjust sleep time to maintain the desired control frequency
+            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
 
         return _captured_observation, _performed_action
 
