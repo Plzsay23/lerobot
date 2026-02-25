@@ -127,30 +127,80 @@ def move_joint_smoothly(robot_arm, joint_name, target_pos, steps=100, delay=0.01
         print(f"❌ [{joint_name}] 제어 중 오류 발생: {e}")
 
 
-def return_to_home(robot_arm, logger=None):
-    """
-    로봇 팔을 안전하게 Home 포지션으로 복귀시킵니다.
-    """
-    msg = "=== 🤖 Return to Home 시퀀스 시작 ==="
-    if logger:
-        logger.info(msg)
-    else:
-        print(msg)
-    
-    # 1. 어깨 (shoulder_lift)
-    move_joint_smoothly(robot_arm, joint_name="shoulder_lift", target_pos=2050, steps=150, delay=0.02)
-    
-    # 2. 팔꿈치 (elbow_flex)
-    move_joint_smoothly(robot_arm, joint_name="elbow_flex", target_pos=2050, steps=150, delay=0.02)
-    
-    # 3. 손목 (wrist_flex)
-    move_joint_smoothly(robot_arm, joint_name="wrist_flex", target_pos=2000, steps=100, delay=0.02)
-    
-    msg_done = "=== ✅ Return to Home 시퀀스 완료 ==="
-    if logger:
-        logger.info(msg_done)
-    else:
-        print(msg_done)
+def return_to_home(robot, logger=None):
+    """검증된 딕셔너리 매핑 방식을 사용한 순차적 복귀 함수"""
+    import time
+    log_func = logger.info if logger else print
+
+    log_func("\n=== 🤖 Return to Home (순차적 복귀) 시작 ===")
+
+    try:
+        # 1. 로봇이 현재 가지고 있는 모터 이름 싹 다 가져오기 (원래 코드 방식)
+        JOINT_KEYS = list(robot.action_features)
+        obs = robot.get_observation()
+        
+        # 2. 현재 모든 모터의 위치를 딕셔너리로 안전하게 추출
+        current_state = {}
+        for key in JOINT_KEYS:
+            if key in obs:
+                val = obs[key]
+                if hasattr(val, "item"): val = val.item() # 텐서 처리
+                current_state[key] = float(val)
+            else:
+                log_func(f"❌ 앗! '{key}' 값을 찾을 수 없습니다. 복귀를 취소합니다.")
+                return
+
+        log_func(f"📊 현재 위치: [ {', '.join(f'{k}: {v:.1f}' for k, v in current_state.items())} ]")
+
+        # ---------------------------------------------------------
+        # 💡 핵심: 특정 모터만 목표값으로 천천히 이동시키는 내부 함수
+        # ---------------------------------------------------------
+        def move_single_joint(target_joint_name, target_value, steps=30, sleep_time=0.02):
+            if target_joint_name not in current_state:
+                log_func(f"⚠️ '{target_joint_name}' 모터를 찾을 수 없어 건너뜁니다.")
+                return
+
+            log_func(f"▶ [{target_joint_name}] 이동 중: {current_state[target_joint_name]:.1f} -> {target_value}")
+
+            # 목표 상태(Target State) 딕셔너리 만들기 (움직일 관절만 값 변경)
+            target_state = current_state.copy()
+            target_state[target_joint_name] = target_value
+
+            # 스텝 수만큼 쪼개서 부드럽게 이동
+            for i in range(1, steps + 1):
+                action_dict = {}
+                for key in JOINT_KEYS:
+                    start_val = current_state[key]
+                    end_val = target_state[key]
+                    # 선형 보간 (현재 위치에서 목표 위치로 쪼개서 전송)
+                    action_dict[key] = start_val + (end_val - start_val) * (i / steps)
+
+                # 원래 작동하던 그 완벽한 방식으로 전송!
+                robot.send_action(action_dict)
+                time.sleep(sleep_time)
+
+            # 이동 완료 후, 현재 상태 업데이트
+            current_state[target_joint_name] = float(target_value)
+
+        # ---------------------------------------------------------
+        # 🧗 3단계 순차적 제어 실행
+        # ---------------------------------------------------------
+        # step 수와 sleep_time을 조절하여 속도를 제어할 수 있습니다.
+        # 예: steps=40, sleep_time=0.02 이면 한 관절당 약 0.8초 소요
+        
+        # 1. 어깨 먼저 들어올리기
+        move_single_joint("shoulder_lift", 2050.0, steps=40)
+        
+        # 2. 어깨 완료 후 팔꿈치 접기
+        move_single_joint("elbow_flex", 2050.0, steps=40)
+        
+        # 3. 팔꿈치 완료 후 손목 정렬
+        move_single_joint("wrist_flex", 2000.0, steps=40)
+
+        log_func("=== ✅ 순차적 홈 복귀 완료. 수고하셨습니다! ===")
+
+    except Exception as e:
+        log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
         
 class RobotClient:
     prefix = "robot_client"
