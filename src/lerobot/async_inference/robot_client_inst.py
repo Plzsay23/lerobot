@@ -80,43 +80,45 @@ from .helpers import (
 )
 
 def return_to_home(robot, logger=None):
-    """현재 위치를 정확히 읽어, 2단계(안전 경유지 -> 홈)로 부드럽게 복귀합니다."""
+    """각 관절의 개별 위치를 정확히 읽어, 2단계로 부드럽게 복귀합니다."""
     import time
     log_func = logger.info if logger else print
     
+    # 🎯 최종 목적지 (접힌 상태)
     TARGET_HOME = [2128, 872, 3184, 2708, 1870, 1540]
-    # 1단계 안전 경유지 (로봇 팔을 꼬이지 않게 위로 살짝 드는 만세 자세)
+    # 🛑 1단계 경유지 (로봇 팔을 꼬이지 않게 위로 살짝 드는 만세 자세)
     SAFE_WAYPOINT = [2128, 2048, 2048, 2048, 1870, 1540]
+    
+    # LeRobot SO-100 모델의 개별 모터 키 이름 (순서가 매우 중요합니다!)
+    JOINT_KEYS = [
+        'shoulder_pan.pos', 
+        'shoulder_lift.pos', 
+        'elbow_flex.pos', 
+        'wrist_flex.pos', 
+        'wrist_roll.pos', 
+        'gripper.pos'
+    ]
     
     try:
         obs = robot.get_observation()
         
-        # 1. 최신 LeRobot 버전에 맞춰서 현재 위치 데이터 찾기
-        current_pos = None
-        # LeRobot 버전마다 다를 수 있는 키 이름들을 전부 수색합니다
-        for key in ["observation.state", "state", "position", "present_position"]:
+        # 1. 개별 키에서 값을 하나씩 뽑아와서 현재 위치 리스트(current_pos) 만들기
+        current_pos = []
+        for key in JOINT_KEYS:
             if key in obs:
-                current_pos = obs[key]
-                break
+                val = obs[key]
+                # 텐서(Tensor) 형태라면 숫자만 쏙 빼옵니다
+                if hasattr(val, "item"):
+                    val = val.item()
+                current_pos.append(val)
+            else:
+                log_func(f"❌ 앗! '{key}' 값을 찾을 수 없습니다! 복귀를 취소합니다.")
+                return
                 
-        # 🚨 [안전장치] 만약 그래도 못 찾으면, 로봇이 튀는 걸 막기 위해 즉시 중단!
-        if current_pos is None:
-            log_func("\n" + "="*50)
-            log_func("❌ 현재 위치를 찾지 못했습니다! 로봇 보호를 위해 복귀를 취소합니다.")
-            log_func(f"🔍 이 로봇이 가진 관찰 데이터 목록: {list(obs.keys())}")
-            log_func("="*50)
-            return
-            
-        # 2. 텐서나 이중 리스트 형태라면 깔끔한 1차원 리스트로 펴주기
-        if hasattr(current_pos, "tolist"):
-            current_pos = current_pos.tolist()
-        if isinstance(current_pos, list) and len(current_pos) > 0 and isinstance(current_pos[0], list):
-            current_pos = current_pos[0]
-            
         log_func(f"\n📊 현재 위치: [ {', '.join(f'{x:.1f}' for x in current_pos)} ]")
         log_func("🧗 1단계: 충돌을 피하기 위해 팔을 안전한 위치로 들어 올립니다...")
         
-        # 3. [1단계 이동] 현재 위치 -> 경유지 (안전하게 들기)
+        # 2. [1단계 이동] 현재 위치 -> 경유지 (안전하게 들기)
         steps = 20
         for i in range(1, steps + 1):
             interpolated_action = []
@@ -124,24 +126,25 @@ def return_to_home(robot, logger=None):
                 step_val = curr + (target - curr) * (i / steps)
                 interpolated_action.append(step_val)
             
-            action_dict = {key: val for key, val in zip(robot.action_features, interpolated_action)}
+            # 정확한 모터 이름과 값을 1:1로 짝지어 전송
+            action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
             robot.send_action(action_dict)
             time.sleep(0.03) 
             
         log_func("🏠 2단계: 최종 홈 포지션으로 부드럽게 접습니다...")
         
-        # 4. [2단계 이동] 경유지 -> 최종 홈 위치 (접기)
+        # 3. [2단계 이동] 경유지 -> 최종 홈 위치 (접기)
         for i in range(1, steps + 1):
             interpolated_action = []
             for curr, target in zip(SAFE_WAYPOINT, TARGET_HOME):
                 step_val = curr + (target - curr) * (i / steps)
                 interpolated_action.append(step_val)
             
-            action_dict = {key: val for key, val in zip(robot.action_features, interpolated_action)}
+            action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
             robot.send_action(action_dict)
             time.sleep(0.03) 
             
-        log_func("✅ 홈 복귀 완료.")
+        log_func("✅ 홈 복귀 완료. 수고하셨습니다!")
         
     except Exception as e:
         log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
