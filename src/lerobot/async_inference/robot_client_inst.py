@@ -81,66 +81,70 @@ from .helpers import (
 )
 
 def return_to_home(robot, logger=None):
-    """이름 매칭(.pos) 및 각도 기반 순차적 복귀 함수"""
+    """현재 위치에서 설정된 기본 상태값(접힌 상태)으로 순차적이고 부드럽게 이동합니다."""
     import time
     log_func = logger.info if logger else print
-
-    log_func("\n=== 🤖 Return to Home (순차적 복귀) 시작 ===")
-
+    
+    # 🚨 [매우 중요] 현재 로봇은 2000대 숫자가 아닌 '각도(Degree)'를 씁니다.
+    # 베이스 -> 어깨 -> 팔꿈치 -> 손목 -> 손목회전 -> 그리퍼 순서입니다.
+    # 우선 안전한 만세 자세(모두 0.0도)로 설정했습니다. 필요시 직접 각도를 수정하세요.
+    TARGET_HOME = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] 
+    
     try:
-        JOINT_KEYS = list(robot.action_features)
+        # 1. 로봇의 현재 관절 각도를 읽어옵니다. (로그에 찍힌 평면적 키 구조에 맞게 수정)
         obs = robot.get_observation()
+        JOINT_KEYS = list(robot.action_features)
         
-        current_state = {}
+        current_pos = []
         for key in JOINT_KEYS:
             if key in obs:
                 val = obs[key]
-                if hasattr(val, "item"): val = val.item()
-                current_state[key] = float(val)
+                if hasattr(val, "item"): val = val.item() # 텐서 변환 방어
+                current_pos.append(float(val))
             else:
-                log_func(f"❌ '{key}' 값을 찾을 수 없습니다.")
+                log_func(f"⚠️ '{key}' 위치를 읽을 수 없어 복귀를 취소합니다.")
                 return
 
-        log_func(f"📊 현재 위치: [ {', '.join(f'{k}: {v:.1f}' for k, v in current_state.items())} ]")
-
-        def move_single_joint(target_joint_name, target_value, steps=30, sleep_time=0.02):
-            if target_joint_name not in current_state:
-                log_func(f"⚠️ '{target_joint_name}' 모터를 찾을 수 없어 건너뜁니다.")
-                return
-
-            log_func(f"▶ [{target_joint_name}] 이동 중: {current_state[target_joint_name]:.1f} -> {target_value}")
-
-            target_state = current_state.copy()
-            target_state[target_joint_name] = target_value
-
+        log_func(f"🏠 홈 포지션으로 순차적 복귀 중... (시작 위치: {current_pos})")
+        
+        steps = 30
+        sleep_time = 0.03
+        
+        # -------------------------------------------------------------
+        # 💡 순차적 이동 로직 (어깨 -> 팔꿈치 -> 손목)
+        # -------------------------------------------------------------
+        # LeRobot SO-100/101의 기본 인덱스: 1(어깨), 2(팔꿈치), 3(손목)
+        sequence_indices = [1, 2, 3]
+        sequence_names = ["어깨(shoulder_lift)", "팔꿈치(elbow_flex)", "손목(wrist_flex)"]
+        
+        # 이동 중 위치를 계속 추적할 리스트
+        working_pos = list(current_pos)
+        
+        for step_idx, joint_idx in enumerate(sequence_indices):
+            log_func(f"▶ {sequence_names[step_idx]} 이동 중...")
+            
+            # 이번 단계의 목표 위치 리스트 (움직일 관절 하나만 TARGET_HOME 값으로 바꿈)
+            step_target_pos = list(working_pos)
+            step_target_pos[joint_idx] = TARGET_HOME[joint_idx]
+            
+            # 2. 현재 위치 -> 이번 단계 목표 위치까지 30단계로 잘게 쪼개서 부드럽게 이동
             for i in range(1, steps + 1):
-                action_dict = {}
-                for key in JOINT_KEYS:
-                    start_val = current_state[key]
-                    end_val = target_state[key]
-                    action_dict[key] = start_val + (end_val - start_val) * (i / steps)
-
+                interpolated_action = []
+                # 원래 쓰셨던 zip(curr, target) 구조 그대로 사용!
+                for curr, target in zip(working_pos, step_target_pos):
+                    step_val = curr + (target - curr) * (i / steps)
+                    interpolated_action.append(step_val)
+                
+                # 🚨 로봇 모터 이름에 맞춰 딕셔너리로 포장해서 보내기
+                action_dict = {key: val for key, val in zip(JOINT_KEYS, interpolated_action)}
                 robot.send_action(action_dict)
                 time.sleep(sleep_time)
-
-            current_state[target_joint_name] = float(target_value)
-
-        # ---------------------------------------------------------
-        # 🧗 3단계 순차적 제어 실행 (.pos 추가 및 각도(Degrees) 값 적용)
-        # ---------------------------------------------------------
-        # 🚨 경고: 아래 0.0 값들을 실제 로봇의 '만세 자세 각도'로 수정하셔야 합니다!
+                
+            # 한 관절의 이동이 완전히 끝나면, 현재 위치(working_pos)를 업데이트
+            working_pos = list(step_target_pos)
+            
+        log_func("✅ 홈 복귀 완료.")
         
-        # 1. 어깨 먼저 들어올리기 (기존 2050 -> 약 0.0도 가정)
-        move_single_joint("shoulder_lift.pos", 0.0, steps=40)
-        
-        # 2. 어깨 완료 후 팔꿈치 접기 (기존 2050 -> 약 0.0도 가정)
-        move_single_joint("elbow_flex.pos", 0.0, steps=40)
-        
-        # 3. 팔꿈치 완료 후 손목 정렬 (기존 2000 -> 약 -10.0도 가정)
-        move_single_joint("wrist_flex.pos", 0.0, steps=40)
-
-        log_func("=== ✅ 순차적 홈 복귀 완료. 수고하셨습니다! ===")
-
     except Exception as e:
         log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
         
