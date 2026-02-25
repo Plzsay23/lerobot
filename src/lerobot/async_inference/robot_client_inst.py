@@ -79,69 +79,47 @@ from .helpers import (
     visualize_action_queue_size,
 )
 
-def return_to_home(robot, logger=None):
-    """인식된 모터 개수에 맞춰 자동으로 대응하는 스마트 복귀 함수"""
-    import time
-    log_func = logger.info if logger else print
-    
-    # 1. 로봇이 현재 실제로 가지고 있는 모터 이름들을 싹 다 가져옵니다!
-    JOINT_KEYS = list(robot.action_features)
-    
-    # 🚨 [여기 수정 필요] 캘리브레이션 후 모터 개수에 맞춰서 숫자를 적어주세요!
-    # (예시: 손목 하나가 빠져서 모터가 5개가 되었다면, 숫자도 5개로 맞춰야 합니다)
-    # 🎯 최종 목적지 (접힌 상태) - 다시 6개로 복구!
-    TARGET_HOME = [2128, 872, 3184, 2708, 1870, 1540]
-    
-    # 🛑 1단계 경유지 (만세 자세) - 다시 6개로 복구!
-    SAFE_WAYPOINT = [2128, 2048, 2048, 2048, 1870, 1540]
-    
+def move_joint_smoothly(robot_arm, joint_name, target_pos, steps=100, delay=0.015):
+    """특정 조인트를 부드럽게 선형 보간으로 이동시킵니다."""
     try:
-        log_func(f"\n🤖 현재 연결된 진짜 모터 목록 ({len(JOINT_KEYS)}개): {JOINT_KEYS}")
+        # 현재 위치 읽기
+        current_pos = robot_arm.get_joint_position(joint_name)
         
-        # 2. [안전장치] 모터 개수와 내가 적은 숫자 개수가 다르면 즉시 중지!
-        if len(JOINT_KEYS) != len(TARGET_HOME):
-            log_func(f"❌ [에러] 모터는 {len(JOINT_KEYS)}개인데, TARGET_HOME 숫자는 {len(TARGET_HOME)}개입니다!")
-            log_func("코드의 TARGET_HOME과 SAFE_WAYPOINT 리스트의 숫자 개수를 모터 개수와 똑같이 맞춰주세요.")
-            return
+        # 선형 보간 궤적 생성
+        trajectory = np.linspace(current_pos, target_pos, steps)
+        
+        print(f"▶ [{joint_name}] Home 이동: {current_pos:.1f} -> {target_pos}")
+        
+        # 궤적을 따라 모터 제어
+        for pos in trajectory:
+            robot_arm.set_joint_position(joint_name, int(pos))
+            time.sleep(delay)
             
-        obs = robot.get_observation()
-        
-        current_pos = []
-        for key in JOINT_KEYS:
-            if key in obs:
-                val = obs[key]
-                if hasattr(val, "item"): val = val.item()
-                current_pos.append(val)
-            else:
-                log_func(f"❌ 앗! '{key}' 값을 찾을 수 없습니다. 복귀를 취소합니다.")
-                return
-                
-        log_func(f"📊 현재 위치: [ {', '.join(f'{x:.1f}' for x in current_pos)} ]")
-        log_func("🧗 1단계: 충돌을 피하기 위해 팔을 안전한 위치로 들어 올립니다...")
-        
-        steps = 20
-        for i in range(1, steps + 1):
-            interpolated_action = []
-            for curr, target in zip(current_pos, SAFE_WAYPOINT):
-                interpolated_action.append(curr + (target - curr) * (i / steps))
-                
-            robot.send_action({k: v for k, v in zip(JOINT_KEYS, interpolated_action)})
-            time.sleep(0.03) 
-            
-        log_func("🏠 2단계: 최종 홈 포지션으로 부드럽게 접습니다...")
-        
-        for i in range(1, steps + 1):
-            interpolated_action = []
-            for curr, target in zip(SAFE_WAYPOINT, TARGET_HOME):
-                interpolated_action.append(curr + (target - curr) * (i / steps))
-                
-            robot.send_action({k: v for k, v in zip(JOINT_KEYS, interpolated_action)})
-            time.sleep(0.03) 
-            
-        log_func("✅ 홈 복귀 완료. 수고하셨습니다!")
-        
     except Exception as e:
-        log_func(f"❌ 홈 복귀 중 에러 발생: {e}")
+        print(f"❌ [{joint_name}] 제어 중 오류 발생: {e}")
+
+def return_to_home(robot_arm):
+    """
+    로봇 팔을 안전하게 Home 포지션으로 복귀시킵니다.
+    지정된 순서(어깨 -> 팔꿈치 -> 손목)대로 천천히 이동하여 하드웨어 무리를 방지합니다.
+    """
+    print("=== 🤖 Return to Home 시퀀스 시작 ===")
+    
+    # [손목]은 현재 상태를 유지하므로 이 단계에서는 제어하지 않습니다.
+    
+    # 1. 어깨(shoulder_lift)를 2050으로 먼저 이동 
+    # (팔을 먼저 들어올려 바닥 충돌 방지)
+    move_joint_smoothly(robot_arm, joint_name="shoulder_lift", target_pos=2050, steps=150, delay=0.02)
+    
+    # 2. 완료 후, 팔꿈치(elbow_flex)를 2050으로 이동
+    # (안전 공간 확보 후 팔꿈치 접기)
+    move_joint_smoothly(robot_arm, joint_name="elbow_flex", target_pos=2050, steps=150, delay=0.02)
+    
+    # 3. 완료 후, 손목(wrist_flex)을 2000으로 이동
+    # (마지막 정렬)
+    move_joint_smoothly(robot_arm, joint_name="wrist_flex", target_pos=2000, steps=100, delay=0.02)
+    
+    print("=== ✅ Return to Home 시퀀스 완료 ===")
         
 class RobotClient:
     prefix = "robot_client"
