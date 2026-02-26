@@ -85,7 +85,7 @@ def return_to_home(robot, logger=None):
     import time
     log_func = logger.info if logger else print
     
-    # 💡 다이나믹셀 Raw 값(0~4096)을 LeRobot 각도(Degree)로 자동 변환하는 헬퍼 함수
+    # 다이나믹셀 Raw 값(0~4096)을 LeRobot 각도로 자동 변환하는 헬퍼 함수
     def raw_to_deg(raw_val):
         return (raw_val - 2048) * (360.0 / 4096.0)
     
@@ -108,19 +108,17 @@ def return_to_home(robot, logger=None):
                 if hasattr(val, "item"): val = val.item()
                 current_pos.append(float(val))
             else:
-                log_func(f"⚠️ '{key}' 위치를 읽을 수 없어 복귀를 취소합니다.")
+                log_func(f"'{key}' 위치를 읽을 수 없어 복귀를 취소합니다.")
                 return
 
-        log_func(f"\n🤖 2단계 안전 복귀 시퀀스 시작...")
+        log_func(f"\n 2단계 안전 복귀 시퀀스 시작...")
         
         steps = 30
         sleep_time = 0.03
         working_pos = list(current_pos)
         
-        # -------------------------------------------------------------
-        # 🧗 [1단계] 순차적 중간 자세 (충돌 방지를 위해 일어서기)
-        # -------------------------------------------------------------
-        log_func("🧗 [1단계] 테이블 충돌 방지를 위해 팔을 안전하게 들어 올립니다.")
+        #  [1단계] 순차적 중간 자세 (충돌 방지를 위해 일어서기)
+        log_func(" [1단계] 테이블 충돌 방지를 위해 팔을 안전하게 들어 올립니다.")
         sequence_indices = [1, 2, 3] # 어깨(1), 팔꿈치(2), 손목(3)
         sequence_names = ["어깨", "팔꿈치", "손목"]
         
@@ -139,10 +137,8 @@ def return_to_home(robot, logger=None):
                 
             working_pos = list(step_target_pos)
             
-        # -------------------------------------------------------------
-        # 📦 [2단계] 다같이 부드럽게 접기 (최종 기본 자세)
-        # -------------------------------------------------------------
-        log_func("📦 [2단계] 알려주신 최종 기본 자세로 부드럽게 접습니다.")
+        #  [2단계] 다같이 부드럽게 접기 (최종 기본 자세)
+        log_func(" [2단계] 최종 기본 자세로 부드럽게 접습니다.")
         
         for i in range(1, steps + 1):
             interpolated_action = []
