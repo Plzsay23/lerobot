@@ -30,6 +30,9 @@ from lerobot.utils.errors import DeviceNotConnectedError
 from ..robot import Robot
 from .config_lekiwi import LeKiwiClientConfig
 
+from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+
 
 class LeKiwiClient(Robot):
     config_class = LeKiwiClientConfig
@@ -71,6 +74,15 @@ class LeKiwiClient(Robot):
 
         self._is_connected = False
         self.logs = {}
+        
+        self.pc_cam_config = OpenCVCameraConfig(
+            index_or_path=0, 
+            fps=25, 
+            width=640, 
+            height=480,
+            warmup_s=2
+        )
+        self.pc_camera = OpenCVCamera(self.pc_cam_config)
 
     @cached_property
     def _state_ft(self) -> dict[str, type]:
@@ -95,7 +107,11 @@ class LeKiwiClient(Robot):
 
     @cached_property
     def _cameras_ft(self) -> dict[str, tuple[int, int, int]]:
-        return {name: (cfg.height, cfg.width, 3) for name, cfg in self.config.cameras.items()}
+        # 기존 카메라들 (front, wrist 등)
+        cam_features = {name: (cfg.height, cfg.width, 3) for name, cfg in self.config.cameras.items()}
+        # [추가] PC 카메라 특징 정보 등록 (H, W, 3)
+        cam_features["pc"] = (self.pc_cam_config.height, self.pc_cam_config.width, 3)
+        return cam_features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -135,6 +151,7 @@ class LeKiwiClient(Robot):
         if self.zmq_observation_socket not in socks or socks[self.zmq_observation_socket] != zmq.POLLIN:
             raise DeviceNotConnectedError("Timeout waiting for LeKiwi Host to connect expired.")
 
+        self.pc_camera.connect()
         self._is_connected = True
 
     def calibrate(self) -> None:
@@ -262,9 +279,11 @@ class LeKiwiClient(Robot):
         # Loop over each configured camera
         for cam_name, frame in frames.items():
             if frame is None:
-                logging.warning("Frame is None")
-                frame = np.zeros((640, 480, 3), dtype=np.uint8)
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
             obs_dict[cam_name] = frame
+            
+        if hasattr(self, 'pc_camera'):
+             obs_dict["pc"] = self.pc_camera.async_read()
 
         return obs_dict
 
@@ -328,6 +347,8 @@ class LeKiwiClient(Robot):
     @check_if_not_connected
     def disconnect(self):
         """Cleans ZMQ comms"""
+        if hasattr(self, 'pc_camera'):
+            self.pc_camera.disconnect()
 
         self.zmq_observation_socket.close()
         self.zmq_cmd_socket.close()
