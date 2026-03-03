@@ -1,18 +1,22 @@
 # main.py
 import time
 import cv2
+
+# 로컬 모듈 임포트 (같은 폴더 내의 vla_models.py, manager_agent.py)
 from vla_models import PickPlaceVLA, CleaningVLA
 from manager_agent import ManagerAgent
 
-# lerobot의 실제 카메라 모듈 임포트
+# lerobot 파이프라인 임포트
 from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
 def main():
     print("=== Multi-VLA Agent System 시작 ===")
     
-    # 1. lerobot 파이프라인으로 카메라 초기화 (0번 기본 웹캠 기준)
+    # 1. Config 객체를 생성하여 카메라 초기화 (0번 카메라 또는 '/dev/video0' 사용)
     print("📷 [System] 카메라를 초기화합니다...")
-    camera = OpenCVCamera(camera_index=0, width=640, height=480)
+    camera_config = OpenCVCameraConfig(index_or_path=0, fps=30, width=640, height=480)
+    camera = OpenCVCamera(camera_config)
     camera.connect()
     
     # 2. VLA 모델 및 매니저(VLM) 로드
@@ -39,10 +43,6 @@ def main():
             print("📷 [카메라 입력] 현재 상황을 촬영 중...")
             image_rgb = camera.read()  # 반환값: RGB 형태의 numpy array
             
-            # (옵션) 캡처된 이미지를 화면에 잠깐 보여주고 싶을 경우
-            # cv2.imshow("Current Observation", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
-            # cv2.waitKey(1)
-            
             # [VLM 판단] 카메라 이미지와 텍스트를 VLM에 전달
             model, target, reason = manager.observe_and_think(image_rgb, user_goal)
 
@@ -67,8 +67,8 @@ def main():
     finally:
         # 안전한 종료 처리
         print("🔌 시스템을 종료하고 카메라를 해제합니다.")
-        camera.disconnect()
-        # cv2.destroyAllWindows()
+        if camera.is_connected:
+            camera.disconnect()
 
 if __name__ == "__main__":
     main()
