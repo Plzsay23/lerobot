@@ -1,55 +1,74 @@
 # main.py
-# 전체 프로그램을 구동하고 구성 요소(환경, 매니저, 모델)를 조립하여 루프를 돌리는 메인 파일
-
 import time
-from environment import SimulationEnv
+import cv2
 from vla_models import PickPlaceVLA, CleaningVLA
 from manager_agent import ManagerAgent
 
-def main():
-    # 1. 환경 생성
-    env = SimulationEnv()
+# lerobot의 실제 카메라 모듈 임포트
+from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
 
-    # 2. 사용할 VLA 모델들(Experts) 등록
-    # 실제 Orin NX에서는 여기서 모델을 VRAM에 로드하거나 경로를 지정함
+def main():
+    print("=== Multi-VLA Agent System 시작 ===")
+    
+    # 1. lerobot 파이프라인으로 카메라 초기화 (0번 기본 웹캠 기준)
+    print("📷 [System] 카메라를 초기화합니다...")
+    camera = OpenCVCamera(camera_index=0, width=640, height=480)
+    camera.connect()
+    
+    # 2. VLA 모델 및 매니저(VLM) 로드
     vla_registry = {
         'pick_place': PickPlaceVLA(name="Arm_A (Gripper)", specialty="이동"),
         'cleaning': CleaningVLA(name="Arm_B (Sponge)", specialty="청소")
     }
-
-    # 3. 매니저(VLM Agent) 생성
     manager = ManagerAgent(vla_registry)
     
-    # 사용자 명령
-    user_goal = "테이블을 깨끗이 치우고 닦아줘"
-    print("===  Multi-VLA Agent System 시작 ===")
+    print("\n✅ 모든 시스템 준비 완료. 인스트럭션을 대기합니다.")
 
-    # 4. 메인 루프 (Observe -> Think -> Act)
-    step = 0
-    while True:
-        step += 1
-        print(f"\n--- Step {step} ---")
-        time.sleep(1) # 생각하는 척
+    # 3. 메인 인터랙티브 루프
+    try:
+        while True:
+            print("\n" + "="*60)
+            user_goal = input("⌨️ 사용자 명령을 입력하세요 (종료 'q'): ")
+            
+            if user_goal.lower() == 'q':
+                break
+            if not user_goal.strip():
+                continue
 
-        # 현재 상태 가져오기
-        current_state = env.get_state()
+            # [카메라 캡처] lerobot 파이프라인 방식으로 현재 프레임 가져오기
+            print("📷 [카메라 입력] 현재 상황을 촬영 중...")
+            image_rgb = camera.read()  # 반환값: RGB 형태의 numpy array
+            
+            # (옵션) 캡처된 이미지를 화면에 잠깐 보여주고 싶을 경우
+            # cv2.imshow("Current Observation", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+            # cv2.waitKey(1)
+            
+            # [VLM 판단] 카메라 이미지와 텍스트를 VLM에 전달
+            model, target, reason = manager.observe_and_think(image_rgb, user_goal)
 
-        # [Manager] 판단
-        model, target, reason = manager.observe_and_think(current_state, user_goal)
+            if model is None:
+                print(f"❌ [에러/거절] {reason}")
+                continue
 
-        # 종료 조건
-        if model is None:
-            print(f" [System] 종료: {reason}")
-            break
+            print(f"\n💡 [VLM 최종 결정] '{model.name}' 실행!")
+            print(f"   - 목표물: {target}")
+            print(f"   - 판단 근거: {reason}")
+            time.sleep(0.5)
 
-        print(f" [System] '{model.name}' 선택됨 ({reason})")
-
-        # [Action] 실행 및 상태 업데이트
-        new_state = model.execute(current_state, target)
-        env.update_state(new_state)
-
-    print("\n===  최종 결과 ===")
-    print(env.get_state())
+            # [Action 실행 (문자열 모사)]
+            print(f"\n🚀 [로봇 제어] {model.name} 실행 중...")
+            time.sleep(2) # 실제 로봇 제어 대기시간
+            
+            # 환경(env) 객체 없이 모델 내부 로직만 출력하도록 단순화
+            model.execute({}, target) 
+            
+            print(f"✅ [작업 완료] 다음 명령을 대기합니다.")
+            
+    finally:
+        # 안전한 종료 처리
+        print("🔌 시스템을 종료하고 카메라를 해제합니다.")
+        camera.disconnect()
+        # cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
