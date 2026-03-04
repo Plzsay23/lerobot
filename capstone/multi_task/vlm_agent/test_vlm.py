@@ -34,7 +34,7 @@ def main():
     try:
         while True:
             print("="*60)
-            user_question = input("🗣️ 질문을 입력하세요 (예: Describe what you see / 종료는 'q'): ")
+            user_question = input(">>> ")
             
             if user_question.lower() == 'q':
                 break
@@ -42,7 +42,6 @@ def main():
                 continue
 
             # 카메라 캡처
-            print("📸 찰칵! 방 사진을 찍었습니다.")
             start_time = time.time()
             image_array = camera.read()
             image_pil = Image.fromarray(image_array)
@@ -61,7 +60,7 @@ def main():
             prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
             inputs = processor(text=prompt, images=[image_pil], return_tensors="pt").to(device)
 
-            print("🤔 VLM이 사진을 보고 생각 중입니다... (답변을 기다려주세요)")
+            print("Thinking...")
             
             # 텍스트 생성
             with torch.no_grad():
@@ -82,7 +81,7 @@ def main():
             
             end_time = time.time()
             
-            print(f"\n🤖 [VLM의 대답] (소요시간: {end_time - start_time:.2f}초)")
+            print(f"\n🤖 [Answer] (inference time: {end_time - start_time:.2f}s)")
             print(f">> {output_text}\n")
 
     finally:
