@@ -60,7 +60,12 @@ def main():
             time.sleep(2) # 실제 로봇 제어 대기시간
             
             # 환경(env) 객체 없이 모델 내부 로직만 출력하도록 단순화
-            model.execute({}, target) 
+            dummy_state = {
+                'table': ['사과', '물병'], 
+                'bin': [], 
+                'surface_status': 'dirty'
+            }
+            model.execute(dummy_state, target)
             
             print(f"✅ [작업 완료] 다음 명령을 대기합니다.")
             
