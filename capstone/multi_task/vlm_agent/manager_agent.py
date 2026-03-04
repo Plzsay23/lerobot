@@ -14,12 +14,8 @@ class VLMClassifier(nn.Module):
         # SmolVLM의 언어 모델 히든 사이즈 가져오기
         hidden_size = self.vlm.config.text_config.hidden_size
         
-        # [수정됨] VLM과 동일하게 bfloat16 타입으로 Linear 레이어 생성
-        self.classifier = nn.Linear(
-            hidden_size, 
-            num_classes, 
-            dtype=self.vlm.dtype # VLM의 데이터 타입(bfloat16)에 맞춤
-        )
+        # [완벽 해결] Linear 레이어를 만든 직후 명시적으로 bfloat16으로 강제 캐스팅합니다.
+        self.classifier = nn.Linear(hidden_size, num_classes).to(dtype=torch.bfloat16)
         
     def forward(self, inputs):
         # 1. VLM을 한 번만 통과시킴 (텍스트 생성 아님!)
@@ -32,7 +28,6 @@ class VLMClassifier(nn.Module):
         # 3. 분류기 통과
         logits = self.classifier(last_token_feature) 
         return logits
-
 
 class ManagerAgent:
     def __init__(self, available_models, model_id="HuggingFaceTB/SmolVLM-Instruct"):
