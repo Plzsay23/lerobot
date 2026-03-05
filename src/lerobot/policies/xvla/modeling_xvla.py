@@ -199,6 +199,7 @@ class XVLAModel(nn.Module):
         domain_id: torch.LongTensor,
         proprio: torch.Tensor,
         action: torch.Tensor,
+        reduction: str = "mean",
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass for the XVLA model.
@@ -226,7 +227,7 @@ class XVLAModel(nn.Module):
             proprio=proprio_m,
             **enc,
         )
-        return self.action_space.compute_loss(pred_action, action)
+        return self.action_space.compute_loss(pred_action, action, reduction=reduction)
 
     @torch.no_grad()
     def generate_actions(
@@ -383,14 +384,24 @@ class XVLAPolicy(PreTrainedPolicy):
             "proprio": proprio,
         }
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]: # 인자 추가
         inputs = self._build_model_inputs(batch)
         targets = self._prepare_action_targets(batch)
-        losses = self.model(action=targets, **inputs)
-        total_loss = sum(losses.values())
-
-        log_dict = {k: v.detach().item() for k, v in losses.items()}
-        log_dict["loss"] = total_loss.detach().item()
+        
+        # reduction 인자 전달
+        losses = self.model(action=targets, reduction=reduction, **inputs)
+        
+        if reduction == "none":
+            # 각 dictionary의 value(loss 텐서)들이 [B] shape를 가짐
+            total_loss = sum(losses.values())
+            # 로그 출력용으로는 배치 평균값을 계산
+            log_dict = {k: v.mean().detach().item() for k, v in losses.items()}
+            log_dict["loss"] = total_loss.mean().detach().item()
+        else:
+            total_loss = sum(losses.values())
+            log_dict = {k: v.detach().item() for k, v in losses.items()}
+            log_dict["loss"] = total_loss.detach().item()
+            
         return total_loss, log_dict
 
     def _get_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:

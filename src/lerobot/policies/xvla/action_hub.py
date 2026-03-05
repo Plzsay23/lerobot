@@ -20,6 +20,7 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # =============================================================================
 # Registry
@@ -388,7 +389,7 @@ class AutoActionSpace(BaseActionSpace):
         """Trim model output max_dim → real_dim."""
         return x[..., : self.real_dim]
 
-    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+    def compute_loss(self, pred: torch.Tensor, target: torch.Tensor, reduction: str = "mean") -> dict[str, torch.Tensor]:
         """
         Compute loss only on the first real_dim dimensions.
 
@@ -401,14 +402,19 @@ class AutoActionSpace(BaseActionSpace):
         target = self._pad_to_model_dim(target)
         assert pred.shape == target.shape, f"Shape mismatch: pred {pred.shape} vs target {target.shape}"
 
-        # only compute loss on the real dimensions
-        joints_loss = (
-            self.mse(
-                pred[:, :, : self.real_dim],
-                target[:, :, : self.real_dim],
-            )
-            * self.JOINTS_SCALE
-        )
+        # F.mse_loss를 사용하여 파라미터로 받은 reduction을 적용합니다.
+        joints_loss = F.mse_loss(
+            pred[:, :, : self.real_dim],
+            target[:, :, : self.real_dim],
+            reduction=reduction
+        ) * self.JOINTS_SCALE
+
+        # reduction이 "none"일 경우 shape는 [B, T, real_dim]이 됩니다.
+        # RA-BC의 가중치는 프레임(배치) 단위로 적용되므로, 
+        # T(시퀀스 길이)와 Action 차원에 대해 평균을 내주어 [B] 형태로 만들어야 합니다.
+        if reduction == "none":
+            # dim=1(시간축), dim=2(액션 차원축)에 대해 평균 계산
+            joints_loss = joints_loss.mean(dim=(1, 2))
 
         return {"joints_loss": joints_loss}
 
