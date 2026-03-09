@@ -34,31 +34,6 @@ from .helpers import (
 from .manager_agent import ManagerAgent
 
 
-
-
-def _is_image_like(value):
-    if isinstance(value, torch.Tensor):
-        return value.ndim in (2, 3)
-    if isinstance(value, np.ndarray):
-        return value.ndim in (2, 3)
-    return False
-
-
-def _select_main_camera_key(obs: dict[str, Any]) -> str | None:
-    preferred = ["top", "front", "wrist", "camera", "image"]
-    image_keys = [k for k, v in obs.items() if _is_image_like(v)]
-    if not image_keys:
-        return None
-
-    for pref in preferred:
-        for key in image_keys:
-            if key == pref or pref in key:
-                return key
-
-    non_depth = [k for k in image_keys if "depth" not in k.lower()]
-    return non_depth[0] if non_depth else image_keys[0]
-
-
 def return_to_home(robot, logger=None):
     import time
     def raw_to_deg(raw_val):
@@ -353,8 +328,8 @@ def async_client(cfg: RobotClientConfig):
     shared_robot.connect()
     
     test_obs = shared_robot.get_observation()
-    main_camera_key = _select_main_camera_key(test_obs)
-    print(f"[VLM] main camera key: {main_camera_key}")
+    camera_keys = [k for k in test_obs.keys() if "image" in k]
+    main_camera_key = camera_keys[0] if camera_keys else None
     
     while True:
         try:
@@ -368,29 +343,15 @@ def async_client(cfg: RobotClientConfig):
             if main_camera_key and main_camera_key in obs:
                 current_image_tensor = obs[main_camera_key]
             else:
-                print("⚠️ [VLM] no valid camera frame found; falling back to zeros")
-                current_image_tensor = torch.zeros((3, 480, 640), dtype=torch.uint8)
+                current_image_tensor = torch.zeros((3, 480, 640))
 
-            prediction = vlm_agent.predict(current_image_tensor, user_input)
-            if prediction["abstained"]:
-                print(f"⚠️ [VLM] abstained from routing | reason={prediction['abstain_reason']} prob={prediction['probability']:.3f} margin={prediction['margin']:.3f}")
+            target_idx = vlm_agent.predict_action_index(current_image_tensor, user_input)
+
+            if target_idx == len(available_models):
                 continue
-
-            selected_label = prediction["label"]
-            label_to_model = vlm_agent.meta.get("label_to_model", {})
-            selected_model_path = label_to_model.get(selected_label)
-
-            if not selected_model_path:
-                target_idx = prediction["index"]
-                if 0 <= target_idx < len(available_models):
-                    print(f"⚠️ [VLM] label_to_model missing for label={selected_label}; falling back to index-based mapping")
-                    selected_model_path = available_models[target_idx]
-                else:
-                    print(f"⚠️ [VLM] no valid model mapping for prediction={prediction}")
-                    continue
-
+            
+            selected_model_path = available_models[target_idx]
             cfg.pretrained_name_or_path = selected_model_path
-            print(f"✅ [VLM] selected label={selected_label} -> model={selected_model_path}")
 
             client = RobotClient(cfg, robot=shared_robot)
             client.set_instruction(user_input)
