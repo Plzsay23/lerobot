@@ -17,7 +17,11 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 from lerobot.robots import (
     Robot,
     RobotConfig,
+    bi_so_follower,
+    koch_follower,
     make_robot_from_config,
+    omx_follower,
+    so_follower,
 )
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
@@ -27,7 +31,7 @@ from .helpers import (
     Action, FPSTracker, Observation, RawObservation, RemotePolicyConfig,
     TimedAction, TimedObservation, get_logger, map_robot_keys_to_lerobot_features
 )
-from manager_agent import ManagerAgent
+from .manager_agent import ManagerAgent
 
 
 def return_to_home(robot, logger=None):
@@ -323,7 +327,8 @@ def async_client(cfg: RobotClientConfig):
     shared_robot = make_robot_from_config(cfg.robot)
     shared_robot.connect()
     
-    camera_keys = [k for k in shared_robot.camera_features.keys()]
+    test_obs = shared_robot.get_observation()
+    camera_keys = [k for k in test_obs.keys() if "image" in k]
     main_camera_key = camera_keys[0] if camera_keys else None
     
     while True:
