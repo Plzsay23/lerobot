@@ -39,36 +39,17 @@ def safe_stop_image_writer(func):
 
 
 def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) -> PIL.Image.Image:
-    if image_array.ndim == 2:
-        if image_array.dtype == np.uint16:
-            return PIL.Image.fromarray(image_array)
-        if image_array.dtype != np.uint8:
-            if range_check:
-                max_ = image_array.max().item()
-                min_ = image_array.min().item()
-                if max_ > 1.0 or min_ < 0.0:
-                    raise ValueError(
-                        "The image data type is float, which requires values in the range [0.0, 1.0]. "
-                        f"However, the provided range is [{min_}, {max_}]. Please adjust the range or "
-                        "provide a uint8/uint16 image with values in a supported range."
-                    )
-            image_array = (image_array * 255).astype(np.uint8)
-        return PIL.Image.fromarray(image_array)
-
+    # TODO(aliberts): handle 1 channel and 4 for depth images
     if image_array.ndim != 3:
-        raise ValueError(f"The array has {image_array.ndim} dimensions, but 2 or 3 are expected for an image.")
+        raise ValueError(f"The array has {image_array.ndim} dimensions, but 3 is expected for an image.")
 
-    if image_array.shape[0] in (1, 3):
+    if image_array.shape[0] == 3:
         # Transpose from pytorch convention (C, H, W) to (H, W, C)
         image_array = image_array.transpose(1, 2, 0)
 
-    channels = image_array.shape[-1]
-    if channels == 1:
-        image_array = image_array[..., 0]
-        return image_array_to_pil_image(image_array, range_check=range_check)
-    elif channels != 3:
+    elif image_array.shape[-1] != 3:
         raise NotImplementedError(
-            f"The image has {channels} channels, but only 1 or 3 are supported for now."
+            f"The image has {image_array.shape[-1]} channels, but 3 is required for now."
         )
 
     if image_array.dtype != np.uint8:

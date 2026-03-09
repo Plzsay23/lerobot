@@ -14,42 +14,12 @@
 
 import logging
 from pprint import pformat
-from typing import Any, cast
+from typing import cast
 
 from lerobot.utils.import_utils import make_device_from_device_class
 
 from .config import RobotConfig
 from .robot import Robot
-
-
-def camera_supports_depth(camera: Any, camera_config: Any) -> bool:
-    return bool(
-        getattr(camera_config, "use_depth", False)
-        or getattr(camera_config, "image_type", None) == "depth"
-        or hasattr(camera, "read_depth")
-    )
-
-
-def get_camera_observation_features(cameras: dict[str, Any], camera_configs: dict[str, Any]) -> dict[str, tuple]:
-    features = {}
-    for cam_key, camera in cameras.items():
-        cfg = camera_configs[cam_key]
-        features[cam_key] = (cfg.height, cfg.width, 3)
-        if camera_supports_depth(camera, cfg):
-            features[f"{cam_key}_depth"] = (cfg.height, cfg.width, 1)
-    return features
-
-
-def capture_camera_observations(cameras: dict[str, Any]) -> dict[str, Any]:
-    observations = {}
-    for cam_key, cam in cameras.items():
-        observations[cam_key] = cam.async_read()
-        if hasattr(cam, "read_depth"):
-            try:
-                observations[f"{cam_key}_depth"] = cam.read_depth()
-            except Exception:
-                pass
-    return observations
 
 
 def make_robot_from_config(config: RobotConfig) -> Robot:

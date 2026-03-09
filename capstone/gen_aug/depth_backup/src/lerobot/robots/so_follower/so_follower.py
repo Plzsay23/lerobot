@@ -69,7 +69,9 @@ class SOFollower(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return get_camera_observation_features(self.cameras, self.config.cameras)
+        return {
+            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
+        }
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -181,8 +183,13 @@ class SOFollower(Robot):
         obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
-        # Capture images from cameras (and depth maps when supported)
-        obs_dict.update(capture_camera_observations(self.cameras))
+
+        # Capture images from cameras
+        for cam_key, cam in self.cameras.items():
+            start = time.perf_counter()
+            obs_dict[cam_key] = cam.async_read()
+            dt_ms = (time.perf_counter() - start) * 1e3
+            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
         return obs_dict
 
