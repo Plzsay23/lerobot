@@ -52,7 +52,6 @@ from lerobot.datasets.utils import (
     get_hf_features_from_features,
     get_safe_version,
     hf_transform_to_torch,
-    is_depth_feature,
     is_valid_version,
     load_episodes,
     load_info,
@@ -436,10 +435,7 @@ class LeRobotDatasetMetadata:
         for key in video_keys:
             if not self.features[key].get("info", None):
                 video_path = self.root / self.video_path.format(video_key=key, chunk_index=0, file_index=0)
-                video_info = get_video_info(video_path)
-                if is_depth_feature(key, self.features[key]):
-                    video_info["video.is_depth_map"] = True
-                self.info["features"][key]["info"] = video_info
+                self.info["features"][key]["info"] = get_video_info(video_path)
 
     def update_chunk_settings(
         self,
@@ -549,14 +545,9 @@ class LeRobotDatasetMetadata:
 
 
 def _encode_video_worker(
-    video_key: str,
-    episode_index: int,
-    root: Path,
-    fps: int,
-    vcodec: str = "libsvtav1",
-    video_suffix: str = ".mp4",
+    video_key: str, episode_index: int, root: Path, fps: int, vcodec: str = "libsvtav1"
 ) -> Path:
-    temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}{video_suffix}"
+    temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
     encode_video_frames(img_dir, temp_path, fps, vcodec=vcodec, overwrite=True)
@@ -1243,7 +1234,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         if has_video_keys and not use_batched_encoding:
             num_cameras = len(self.meta.video_keys)
-            video_suffix = Path(self.meta.video_path).suffix if self.meta.video_path else ".mp4"
             if parallel_encoding and num_cameras > 1:
                 # TODO(Steven): Ideally we would like to control the number of threads per encoding such that:
                 # num_cameras * num_threads = (total_cpu -1)
@@ -1256,7 +1246,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
                             self.root,
                             self.fps,
                             self.vcodec,
-                            video_suffix,
                         ): video_key
                         for video_key in self.meta.video_keys
                     }
@@ -1568,14 +1557,11 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
         """
-        Use ffmpeg to convert frames stored as png into dataset video files.
+        Use ffmpeg to convert frames stored as png into mp4 videos.
         Note: `encode_video_frames` is a blocking call. Making it asynchronous shouldn't speedup encoding,
         since video encoding with ffmpeg is already using multithreading.
         """
-        video_suffix = Path(self.meta.video_path).suffix if self.meta.video_path else ".mp4"
-        return _encode_video_worker(
-            video_key, episode_index, self.root, self.fps, self.vcodec, video_suffix=video_suffix
-        )
+        return _encode_video_worker(video_key, episode_index, self.root, self.fps, self.vcodec)
 
     @classmethod
     def create(

@@ -64,6 +64,7 @@ DEFAULT_SUBTASKS_PATH = "meta/subtasks.parquet"
 DEFAULT_EPISODES_PATH = EPISODES_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_DATA_PATH = DATA_DIR + "/" + CHUNK_FILE_PATTERN + ".parquet"
 DEFAULT_VIDEO_PATH = VIDEO_DIR + "/{video_key}/" + CHUNK_FILE_PATTERN + ".mp4"
+DEFAULT_DEPTH_VIDEO_PATH = VIDEO_DIR + "/{video_key}/" + CHUNK_FILE_PATTERN + ".mkv"
 DEFAULT_IMAGE_PATH = "images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.png"
 
 LEGACY_EPISODES_PATH = "meta/episodes.jsonl"
@@ -79,6 +80,50 @@ DEFAULT_FEATURES = {
 }
 
 T = TypeVar("T")
+
+
+def get_channel_count_from_shape(shape: tuple[int, ...] | list[int] | None) -> int | None:
+    if shape is None or len(shape) != 3:
+        return None
+
+    if shape[0] in (1, 3, 4):
+        return shape[0]
+    if shape[-1] in (1, 3, 4):
+        return shape[-1]
+    return None
+
+
+def is_depth_feature_key(key: str | None) -> bool:
+    if key is None:
+        return False
+
+    last_token = key.split(".")[-1].lower()
+    return last_token == "depth" or last_token.endswith("_depth") or last_token.startswith("depth_")
+
+
+def is_depth_feature(key: str | None, feature: dict | None) -> bool:
+    if feature is None:
+        return False
+
+    info = feature.get("info") if isinstance(feature, dict) else None
+    if isinstance(info, dict) and info.get("video.is_depth_map"):
+        return True
+
+    channels = get_channel_count_from_shape(feature.get("shape")) if isinstance(feature, dict) else None
+    return bool(channels == 1 and is_depth_feature_key(key))
+
+
+def dataset_uses_depth_videos(features: dict[str, dict], use_videos: bool) -> bool:
+    if not use_videos:
+        return False
+
+    return any(ft.get("dtype") == "video" and is_depth_feature(key, ft) for key, ft in features.items())
+
+
+def get_default_video_path(features: dict[str, dict], use_videos: bool) -> str | None:
+    if not use_videos:
+        return None
+    return DEFAULT_DEPTH_VIDEO_PATH if dataset_uses_depth_videos(features, use_videos=True) else DEFAULT_VIDEO_PATH
 
 
 def get_parquet_file_size_in_mb(parquet_path: str | Path) -> float:
@@ -394,26 +439,42 @@ def load_episodes(local_dir: Path) -> datasets.Dataset:
 
 
 def load_image_as_numpy(
-    fpath: str | Path, dtype: np.dtype = np.float32, channel_first: bool = True
+    fpath: str | Path, dtype: np.dtype | None = np.float32, channel_first: bool = True
 ) -> np.ndarray:
     """Load an image from a file into a numpy array.
 
     Args:
         fpath (str | Path): Path to the image file.
-        dtype (np.dtype): The desired data type of the output array. If floating,
-            pixels are scaled to [0, 1].
+        dtype (np.dtype | None): The desired data type of the output array. If floating,
+            integer images are scaled to [0, 1] using the full range of the source dtype.
+            If None, the image dtype is preserved.
         channel_first (bool): If True, converts the image to (C, H, W) format.
             Otherwise, it remains in (H, W, C) format.
 
     Returns:
         np.ndarray: The image as a numpy array.
     """
-    img = PILImage.open(fpath).convert("RGB")
-    img_array = np.array(img, dtype=dtype)
-    if channel_first:  # (H, W, C) -> (C, H, W)
-        img_array = np.transpose(img_array, (2, 0, 1))
-    if np.issubdtype(dtype, np.floating):
-        img_array /= 255.0
+    img = PILImage.open(fpath)
+    img_array = np.array(img)
+
+    if dtype is not None:
+        target_dtype = np.dtype(dtype)
+        source_dtype = img_array.dtype
+        if np.issubdtype(target_dtype, np.floating):
+            img_array = img_array.astype(target_dtype)
+            if np.issubdtype(source_dtype, np.integer):
+                img_array /= np.iinfo(source_dtype).max
+        else:
+            img_array = img_array.astype(target_dtype)
+
+    if channel_first:
+        if img_array.ndim == 2:
+            img_array = img_array[None, ...]
+        elif img_array.ndim == 3:
+            img_array = np.transpose(img_array, (2, 0, 1))
+    elif img_array.ndim == 2:
+        img_array = img_array[..., None]
+
     return img_array
 
 
@@ -836,7 +897,7 @@ def create_empty_dataset_info(
         "fps": fps,
         "splits": {},
         "data_path": DEFAULT_DATA_PATH,
-        "video_path": DEFAULT_VIDEO_PATH if use_videos else None,
+        "video_path": get_default_video_path(features, use_videos),
         "features": features,
     }
 
@@ -1105,7 +1166,7 @@ def validate_feature_image_or_video(
 
     Args:
         name (str): The name of the feature.
-        expected_shape (list[str]): The expected shape (C, H, W).
+        expected_shape (list[str]): The expected shape (H, W, C).
         value: The image data to validate.
 
     Returns:
@@ -1115,9 +1176,15 @@ def validate_feature_image_or_video(
     error_message = ""
     if isinstance(value, np.ndarray):
         actual_shape = value.shape
-        c, h, w = expected_shape
-        if len(actual_shape) != 3 or (actual_shape != (c, h, w) and actual_shape != (h, w, c)):
-            error_message += f"The feature '{name}' of shape '{actual_shape}' does not have the expected shape '{(c, h, w)}' or '{(h, w, c)}'.\n"
+        h, w, c = expected_shape
+        valid_shapes = {(h, w, c), (c, h, w)}
+        if c == 1:
+            valid_shapes.add((h, w))
+        if actual_shape not in valid_shapes:
+            error_message += (
+                f"The feature '{name}' of shape '{actual_shape}' does not have one of the expected shapes "
+                f"'{sorted(valid_shapes)}'.\n"
+            )
     elif isinstance(value, PILImage.Image):
         pass
     else:

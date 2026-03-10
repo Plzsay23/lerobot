@@ -15,7 +15,7 @@
 # limitations under the License.
 import numpy as np
 
-from lerobot.datasets.utils import get_channel_count_from_shape, is_depth_feature, load_image_as_numpy
+from lerobot.datasets.utils import load_image_as_numpy
 
 DEFAULT_QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 
@@ -227,17 +227,18 @@ def auto_downsample_height_width(img: np.ndarray, target_size: int = 150, max_si
     return img[:, ::downsample_factor, ::downsample_factor]
 
 
-def sample_images(image_paths: list[str], dtype: np.dtype | None = None) -> np.ndarray:
+def sample_images(image_paths: list[str]) -> np.ndarray:
     sampled_indices = sample_indices(len(image_paths))
 
     images = None
     for i, idx in enumerate(sampled_indices):
         path = image_paths[idx]
-        img = load_image_as_numpy(path, dtype=dtype, channel_first=True)
+        # we load as uint8 to reduce memory usage
+        img = load_image_as_numpy(path, dtype=np.uint8, channel_first=True)
         img = auto_downsample_height_width(img)
 
         if images is None:
-            images = np.empty((len(sampled_indices), *img.shape), dtype=img.dtype)
+            images = np.empty((len(sampled_indices), *img.shape), dtype=np.uint8)
 
         images[i] = img
 
@@ -508,7 +509,7 @@ def compute_episode_stats(
             continue
 
         if features[key]["dtype"] in ["image", "video"]:
-            ep_ft_array = sample_images(data, dtype=None)
+            ep_ft_array = sample_images(data)
             axes_to_reduce = (0, 2, 3)
             keepdims = True
         else:
@@ -521,20 +522,9 @@ def compute_episode_stats(
         )
 
         if features[key]["dtype"] in ["image", "video"]:
-            channels = get_channel_count_from_shape(features[key].get("shape"))
-            if channels is None and ep_ft_array.ndim >= 2:
-                channels = ep_ft_array.shape[1]
-
-            is_depth_visual = is_depth_feature(key, features[key]) or (
-                channels == 1 and np.issubdtype(ep_ft_array.dtype, np.uint16)
-            )
-
-            if is_depth_visual:
-                ep_stats[key] = {k: v if k == "count" else np.squeeze(v, axis=0) for k, v in ep_stats[key].items()}
-            else:
-                ep_stats[key] = {
-                    k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
-                }
+            ep_stats[key] = {
+                k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
+            }
 
     return ep_stats
 
@@ -553,11 +543,8 @@ def _validate_stat_value(value: np.ndarray, key: str, feature_key: str) -> None:
     if key == "count" and value.shape != (1,):
         raise ValueError(f"Shape of 'count' must be (1), but is {value.shape} instead.")
 
-    if "image" in feature_key and key != "count":
-        if value.ndim != 3 or value.shape[1:] != (1, 1) or value.shape[0] not in (1, 3, 4):
-            raise ValueError(
-                f"Shape of quantile '{key}' must be (C,1,1) with C in {{1,3,4}}, but is {value.shape} instead."
-            )
+    if "image" in feature_key and key != "count" and value.shape != (3, 1, 1):
+        raise ValueError(f"Shape of quantile '{key}' must be (3,1,1), but is {value.shape} instead.")
 
 
 def _assert_type_and_shape(stats_list: list[dict[str, dict]]):

@@ -16,6 +16,8 @@ import logging
 from pprint import pformat
 from typing import Any, cast
 
+import numpy as np
+
 from lerobot.utils.import_utils import make_device_from_device_class
 
 from .config import RobotConfig
@@ -46,7 +48,10 @@ def capture_camera_observations(cameras: dict[str, Any]) -> dict[str, Any]:
         observations[cam_key] = cam.async_read()
         if hasattr(cam, "read_depth"):
             try:
-                observations[f"{cam_key}_depth"] = cam.read_depth()
+                depth = cam.read_depth()
+                if isinstance(depth, np.ndarray) and depth.ndim == 2:
+                    depth = depth[..., None]
+                observations[f"{cam_key}_depth"] = depth
             except Exception:
                 pass
     return observations

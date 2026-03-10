@@ -20,14 +20,12 @@ import shutil
 import tempfile
 import warnings
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import Any, ClassVar
 
 import av
 import fsspec
-import numpy as np
 import pyarrow as pa
 import torch
 import torchvision
@@ -43,87 +41,6 @@ def get_safe_default_codec():
             "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
         )
         return "pyav"
-
-
-@lru_cache(maxsize=256)
-def _get_cached_video_info(video_path: str) -> dict:
-    return get_video_info(video_path)
-
-
-def is_depth_video_file(video_path: Path | str) -> bool:
-    video_info = _get_cached_video_info(str(video_path))
-    pix_fmt = video_info.get("video.pix_fmt", "")
-    channels = video_info.get("video.channels")
-    return bool(video_info.get("video.is_depth_map") or (channels == 1 and "gray16" in pix_fmt))
-
-
-def _is_depth_image_file(image_path: Path | str) -> bool:
-    with Image.open(image_path) as image:
-        image_array = np.array(image)
-    return image_array.dtype == np.uint16 and image_array.ndim in (2, 3)
-
-
-def _decode_depth_video_frames_pyav(
-    video_path: Path | str,
-    timestamps: list[float],
-    tolerance_s: float,
-    log_loaded_timestamps: bool = False,
-) -> torch.Tensor:
-    video_path = str(video_path)
-    video_info = _get_cached_video_info(video_path)
-    fps = float(video_info["video.fps"])
-    requested_indices = [round(ts * fps) for ts in timestamps]
-
-    if len(requested_indices) == 0:
-        return torch.empty((0, 1, 0, 0), dtype=torch.float32)
-
-    max_index = max(requested_indices)
-    requested_index_set = set(requested_indices)
-    decoded_by_index: dict[int, np.ndarray] = {}
-    decoded_timestamps: dict[int, float] = {}
-
-    with av.open(video_path, "r") as container:
-        for frame_idx, frame in enumerate(container.decode(video=0)):
-            if frame_idx > max_index:
-                break
-            if frame_idx not in requested_index_set:
-                continue
-
-            frame_array = frame.to_ndarray()
-            if frame_array.ndim != 2:
-                raise ValueError(
-                    f"Depth video '{video_path}' decoded to shape {frame_array.shape}, expected a 2D frame."
-                )
-
-            decoded_by_index[frame_idx] = frame_array
-            decoded_timestamps[frame_idx] = frame_idx / fps
-
-            if log_loaded_timestamps:
-                logging.info(f"Depth frame loaded at timestamp={decoded_timestamps[frame_idx]:.4f}")
-
-            if len(decoded_by_index) == len(requested_index_set):
-                break
-
-    missing_indices = sorted(requested_index_set.difference(decoded_by_index))
-    if missing_indices:
-        raise FrameTimestampError(
-            f"Failed to decode requested depth frame indices {missing_indices} from video {video_path}."
-        )
-
-    loaded_ts = torch.tensor([decoded_timestamps[idx] for idx in requested_indices], dtype=torch.float32)
-    query_ts = torch.tensor(timestamps, dtype=torch.float32)
-    deltas = torch.abs(query_ts - loaded_ts)
-    is_within_tol = deltas < tolerance_s
-    assert is_within_tol.all(), (
-        f"One or several depth query timestamps unexpectedly violate the tolerance ({deltas[~is_within_tol]} > {tolerance_s=})."
-        f"\nqueried timestamps: {query_ts}"
-        f"\nloaded timestamps: {loaded_ts}"
-        f"\nvideo: {video_path}"
-    )
-
-    frames = np.stack([decoded_by_index[idx] for idx in requested_indices])
-    frames = torch.from_numpy(frames).unsqueeze(1).to(torch.float32)
-    return frames
 
 
 def decode_video_frames(
@@ -146,9 +63,6 @@ def decode_video_frames(
 
     Currently supports torchcodec on cpu and pyav.
     """
-    if is_depth_video_file(video_path):
-        return _decode_depth_video_frames_pyav(video_path, timestamps, tolerance_s)
-
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
@@ -185,11 +99,6 @@ def decode_video_frames_torchvision(
     and all subsequent frames until reaching the requested frame. The number of key frames in a video
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
-    if is_depth_video_file(video_path):
-        return _decode_depth_video_frames_pyav(
-            video_path, timestamps, tolerance_s, log_loaded_timestamps=log_loaded_timestamps
-        )
-
     video_path = str(video_path)
 
     # set backend
@@ -332,11 +241,6 @@ def decode_video_frames_torchcodec(
     and all subsequent frames until reaching the requested frame. The number of key frames in a video
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
-    if is_depth_video_file(video_path):
-        return _decode_depth_video_frames_pyav(
-            video_path, timestamps, tolerance_s, log_loaded_timestamps=log_loaded_timestamps
-        )
-
     if decoder_cache is None:
         decoder_cache = _default_decoder_cache
 
@@ -410,6 +314,10 @@ def encode_video_frames(
     preset: int | None = None,
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
+    # Check encoder availability
+    if vcodec not in ["h264", "hevc", "libsvtav1"]:
+        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: h264, hevc, libsvtav1.")
+
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
 
@@ -419,59 +327,41 @@ def encode_video_frames(
 
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Encoders/pixel formats incompatibility check
+    if (vcodec == "libsvtav1" or vcodec == "hevc") and pix_fmt == "yuv444p":
+        logging.warning(
+            f"Incompatible pixel format 'yuv444p' for codec {vcodec}, auto-selecting format 'yuv420p'"
+        )
+        pix_fmt = "yuv420p"
+
     # Get input frames
     template = "frame-" + ("[0-9]" * 6) + ".png"
     input_list = sorted(
         glob.glob(str(imgs_dir / template)), key=lambda x: int(x.split("-")[-1].split(".")[0])
     )
 
+    # Define video output frame size (assuming all input frames are the same size)
     if len(input_list) == 0:
         raise FileNotFoundError(f"No images found in {imgs_dir}.")
-
     with Image.open(input_list[0]) as dummy_image:
         width, height = dummy_image.size
-        dummy_array = np.array(dummy_image)
 
-    is_depth_frames = dummy_array.dtype == np.uint16 and dummy_array.ndim in (2, 3)
-
-    effective_vcodec = vcodec
-    effective_pix_fmt = pix_fmt
+    # Define video codec options
     video_options = {}
 
-    if is_depth_frames:
-        if video_path.suffix.lower() != ".mkv":
-            raise ValueError(
-                "16-bit depth videos must be stored in an .mkv container so the depth map can remain lossless. "
-                f"Got output path: {video_path}"
-            )
+    if g is not None:
+        video_options["g"] = str(g)
 
-        effective_vcodec = "ffv1"
-        effective_pix_fmt = "gray16le"
-    else:
-        if effective_vcodec not in ["h264", "hevc", "libsvtav1"]:
-            raise ValueError(
-                f"Unsupported video codec: {effective_vcodec}. Supported codecs are: h264, hevc, libsvtav1."
-            )
+    if crf is not None:
+        video_options["crf"] = str(crf)
 
-        if (effective_vcodec == "libsvtav1" or effective_vcodec == "hevc") and effective_pix_fmt == "yuv444p":
-            logging.warning(
-                f"Incompatible pixel format 'yuv444p' for codec {effective_vcodec}, auto-selecting format 'yuv420p'"
-            )
-            effective_pix_fmt = "yuv420p"
+    if fast_decode:
+        key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
+        value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
+        video_options[key] = value
 
-        if g is not None:
-            video_options["g"] = str(g)
-
-        if crf is not None:
-            video_options["crf"] = str(crf)
-
-        if fast_decode:
-            key = "svtav1-params" if effective_vcodec == "libsvtav1" else "tune"
-            value = f"fast-decode={fast_decode}" if effective_vcodec == "libsvtav1" else "fastdecode"
-            video_options[key] = value
-
-        if effective_vcodec == "libsvtav1":
-            video_options["preset"] = str(preset) if preset is not None else "12"
+    if vcodec == "libsvtav1":
+        video_options["preset"] = str(preset) if preset is not None else "12"
 
     # Set logging level
     if log_level is not None:
@@ -480,28 +370,23 @@ def encode_video_frames(
 
     # Create and open output file (overwrite by default)
     with av.open(str(video_path), "w") as output:
-        output_stream = output.add_stream(effective_vcodec, fps, options=video_options)
-        output_stream.pix_fmt = effective_pix_fmt
+        output_stream = output.add_stream(vcodec, fps, options=video_options)
+        output_stream.pix_fmt = pix_fmt
         output_stream.width = width
         output_stream.height = height
 
         # Loop through input frames and encode them
         for input_data in input_list:
             with Image.open(input_data) as input_image:
-                if is_depth_frames:
-                    input_array = np.array(input_image, dtype=np.uint16)
-                    if input_array.ndim == 3 and input_array.shape[-1] == 1:
-                        input_array = input_array[..., 0]
-                    input_frame = av.VideoFrame.from_ndarray(input_array, format="gray16le")
-                else:
-                    input_image = input_image.convert("RGB")
-                    input_frame = av.VideoFrame.from_image(input_image)
-
-                for packet in output_stream.encode(input_frame):
+                input_image = input_image.convert("RGB")
+                input_frame = av.VideoFrame.from_image(input_image)
+                packet = output_stream.encode(input_frame)
+                if packet:
                     output.mux(packet)
 
         # Flush the encoder
-        for packet in output_stream.encode(None):
+        packet = output_stream.encode()
+        if packet:
             output.mux(packet)
 
     # Reset logging level
@@ -557,14 +442,12 @@ def concatenate_video_files(
         tmp_concatenate_path, mode="r", format="concat", options={"safe": "0"}
     )  # safe = 0 allows absolute paths as well as relative paths
 
-    temp_suffix = output_video_path.suffix if output_video_path.suffix else ".mp4"
-    with tempfile.NamedTemporaryFile(suffix=temp_suffix, delete=False) as tmp_named_file:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
-    output_options = {"movflags": "faststart"} if temp_suffix in {".mp4", ".mov"} else None
     output_container = av.open(
-        tmp_output_video_path, mode="w", options=output_options
-    )  # faststart is to move the metadata to the beginning of the file to speed up loading when supported
+        tmp_output_video_path, mode="w", options={"movflags": "faststart"}
+    )  # faststart is to move the metadata to the beginning of the file to speed up loading
 
     # Replicate input streams in output container
     stream_map = {}
@@ -679,15 +562,13 @@ def get_video_info(video_path: Path | str) -> dict:
         video_info["video.width"] = video_stream.width
         video_info["video.codec"] = video_stream.codec.canonical_name
         video_info["video.pix_fmt"] = video_stream.pix_fmt
+        video_info["video.is_depth_map"] = False
 
-        # Prefer the true average frame rate when available. `base_rate` can be misleading
-        # for lossless intra-frame codecs such as ffv1 in mkv containers.
-        frame_rate = video_stream.average_rate or video_stream.guessed_rate or video_stream.base_rate
-        video_info["video.fps"] = int(round(float(frame_rate)))
+        # Calculate fps from r_frame_rate
+        video_info["video.fps"] = int(video_stream.base_rate)
 
         pixel_channels = get_video_pixel_channels(video_stream.pix_fmt)
         video_info["video.channels"] = pixel_channels
-        video_info["video.is_depth_map"] = pixel_channels == 1 and "gray16" in video_stream.pix_fmt
 
     # Reset logging level
     av.logging.restore_default_callback()

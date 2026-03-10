@@ -359,16 +359,13 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
         dst_file_durations = video_idx["dst_file_durations"]
 
         for src_chunk_idx, src_file_idx in unique_chunk_file_pairs:
-            src_video_path_template = src_meta.video_path or DEFAULT_VIDEO_PATH
-            dst_video_path_template = dst_meta.video_path or DEFAULT_VIDEO_PATH
-
-            src_path = src_meta.root / src_video_path_template.format(
+            src_path = src_meta.root / DEFAULT_VIDEO_PATH.format(
                 video_key=key,
                 chunk_index=src_chunk_idx,
                 file_index=src_file_idx,
             )
 
-            dst_path = dst_meta.root / dst_video_path_template.format(
+            dst_path = dst_meta.root / DEFAULT_VIDEO_PATH.format(
                 video_key=key,
                 chunk_index=chunk_idx,
                 file_index=file_idx,
@@ -398,7 +395,7 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
                 dst_key = (chunk_idx, file_idx)
                 videos_idx[key]["src_to_offset"][(src_chunk_idx, src_file_idx)] = 0
                 videos_idx[key]["src_to_dst"][(src_chunk_idx, src_file_idx)] = dst_key
-                dst_path = dst_meta.root / dst_video_path_template.format(
+                dst_path = dst_meta.root / DEFAULT_VIDEO_PATH.format(
                     video_key=key,
                     chunk_index=chunk_idx,
                     file_index=file_idx,
