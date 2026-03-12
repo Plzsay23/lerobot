@@ -3,12 +3,10 @@ import numpy as np
 from datasets import load_dataset
 
 # 녹화할 때 사용했던 HF_USER/TASK_NAME을 적어주세요.
-DATASET_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/plzsay")
+DATASET_ID = "plzsay/black"
 
-# 현재 스크립트 위치(lerobot/src/lerobot/datasets) 기준으로 최상위 폴더를 찾아가서 저장
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../")) 
-# Done Token이 추가된 새로운 데이터셋이 저장될 폴더 이름
-SAVE_PATH = os.path.join(BASE_DIR, "dataset_with_done_token")
+# 1.0(Done Token)이 추가되어 새로 저장될 폴더 경로
+SAVE_PATH = "./dataset_with_done_token_black"
 # ==========================================
 
 def main():
