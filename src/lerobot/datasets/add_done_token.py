@@ -3,7 +3,7 @@ import numpy as np
 from datasets import load_dataset
 
 # 녹화할 때 사용했던 HF_USER/TASK_NAME을 적어주세요.
-DATASET_ID = "HF_USER/TASK_NAME" 
+DATASET_PATH = os.path.expanduser("~/.cache/huggingface/lerobot/plzsay")
 
 # 현재 스크립트 위치(lerobot/src/lerobot/datasets) 기준으로 최상위 폴더를 찾아가서 저장
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../")) 
